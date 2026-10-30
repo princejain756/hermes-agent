@@ -63,8 +63,26 @@ def _success(platform: str, chat_id, warnings=None, **fields) -> dict:
 
 _NO_DELIVERABLE = "No deliverable text or media remained after processing MEDIA tags"
 
-_TELEGRAM_TRANSIENT_MARKERS = ("bad gateway", "502", "too many requests", "429", "service unavailable", "503",
-                               "gateway timeout", "504")
+_TELEGRAM_TRANSIENT_PHRASES = ("bad gateway", "too many requests", "service unavailable", "gateway timeout")
+_TELEGRAM_STATUS_RE = re.compile(r"\b(?:http|status|error\s*code|code)\s*[:=#/]?\s*(429|5\d\d)\b")
+
+
+def _telegram_error_status(exc: Exception) -> int | None:
+    """Structured HTTP status on a transport exception (``status_code``/``error_code`` attrs or a
+    carried ``response``), or None. Classifying the status itself, never digits that happen to sit
+    in the message text (#146922): a parse error's URL path must not retry as a 502."""
+    for attr in ("status_code", "error_code", "status"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return int(value)
+    response = getattr(exc, "response", None)
+    if response is not None:
+        value = getattr(response, "status_code", None) or getattr(response, "status", None)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return int(value)
+    return None
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -76,10 +94,15 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
             return max(float(retry_after), 0.0)
         except (TypeError, ValueError):
             return 1.0
+    status = _telegram_error_status(exc)
+    if status is not None:
+        return float(2 ** attempt) if status == 429 or status >= 500 else None
     text = str(exc).lower()
     if "timed out" in text or "timeout" in text:
         return None
-    return float(2 ** attempt) if any(marker in text for marker in _TELEGRAM_TRANSIENT_MARKERS) else None
+    if any(phrase in text for phrase in _TELEGRAM_TRANSIENT_PHRASES):
+        return float(2 ** attempt)
+    return float(2 ** attempt) if _TELEGRAM_STATUS_RE.search(text) else None
 
 
 async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
