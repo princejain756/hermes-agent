@@ -5,7 +5,6 @@ import contextlib
 import inspect
 import ipaddress
 import logging
-import math
 import os
 import random
 import re
@@ -19,6 +18,7 @@ import uuid
 import weakref
 from abc import ABC, abstractmethod
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
+from gateway.platforms.base_extra import coerce_float_extra
 from gateway.platforms.base_log_safety import safe_url_for_log
 
 from utils import normalize_proxy_url
@@ -2441,18 +2441,8 @@ class BasePlatformAdapter(ABC):
 
     def _coerce_float_extra(self, key: str, default: float, *, min_value: float = 0.0, max_value: Optional[float] = None) -> float:
         """Float from ``config.extra``; NaN/Inf/negative/unparseable → ``default``; clamped to ``[min_value, max_value]``."""
-        extra = getattr(self.config, "extra", None) or {}
-        try:  # float(None) → TypeError → default
-            parsed = float(extra.get(key))
-        except (TypeError, ValueError):
-            parsed = float(default)
-        if not math.isfinite(parsed) or parsed < 0:
-            parsed = float(default)
-        parsed = max(parsed, min_value)
-        if max_value is not None and parsed > max_value:
-            logger.warning("%s=%s exceeds the %s ceiling; clamped", key, parsed, max_value)
-            parsed = max_value
-        return parsed
+        return coerce_float_extra(getattr(self.config, "extra", None) or {}, key, default,
+                                  min_value=min_value, max_value=max_value)
 
     def _configure_text_batch_delays(self) -> None:
         """Read ``text_batch_delay_seconds`` / ``text_batch_split_delay_seconds`` from ``config.extra`` at the shared cadence."""
@@ -4714,13 +4704,19 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
+        # A buffered batch is an undelivered message (on Matrix the cursor already advanced, so
+        # it can never be redelivered): cancel its debounce timer and join the spool (#146858).
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
+            for task in self._pending_text_batch_tasks.values():
+                task.cancel()
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+            flush_pending_to_file(self._pending_text_batches, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
                        self._pending_messages, self._active_sessions, self._requeue_counts,
+                       self._pending_text_batches, self._pending_text_batch_tasks,
                        self._text_debounce_store()):
             bucket.clear()
 

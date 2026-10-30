@@ -9,6 +9,8 @@ Telegram and Feishu.
 """
 
 import asyncio
+import contextlib
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -201,3 +203,64 @@ class TestWeComTextBatching:
         text = adapter.handle_message.call_args[0][0].text
         assert "first part" in text
         assert "second part" in text
+
+
+# =====================================================================
+# Shutdown must not drop a buffered batch (regression for #146858)
+# =====================================================================
+
+def _make_shutdown_adapter():
+    """WeCom adapter with the extra state cancel_background_tasks() touches."""
+    adapter = _make_wecom_adapter()
+    adapter._background_tasks = set()
+    adapter._expected_cancelled_tasks = set()
+    adapter._session_tasks = {}
+    adapter._requeue_counts = {}
+    return adapter
+
+
+def _spool_payloads():
+    from hermes_constants import get_hermes_home
+    spool = get_hermes_home() / "pending_messages"
+    return [json.loads(p.read_text(encoding="utf-8-sig")) for p in spool.glob("pending-*.json")]
+
+
+class TestTextBatchShutdown:
+    @pytest.mark.asyncio
+    async def test_buffered_batch_spooled_and_timer_cancelled(self):
+        adapter = _make_shutdown_adapter()
+
+        adapter._enqueue_text_event(_make_event("first part", Platform.WECOM))
+        adapter._enqueue_text_event(_make_event("second part", Platform.WECOM))
+        key = next(iter(adapter._pending_text_batches))
+        timer_task = adapter._pending_text_batch_tasks[key]
+
+        await adapter.cancel_background_tasks()
+
+        assert not adapter._pending_text_batches
+        assert not adapter._pending_text_batch_tasks
+        with contextlib.suppress(asyncio.CancelledError):
+            await timer_task
+        assert timer_task.done()
+
+        adapter.handle_message.assert_not_called()
+        payload = next(p for p in _spool_payloads() if p.get("session_key") == key)
+        dumped = json.dumps(payload["data"])
+        assert "first part" in dumped
+        assert "second part" in dumped
+
+    @pytest.mark.asyncio
+    async def test_batch_with_finished_timer_still_spooled(self):
+        adapter = _make_shutdown_adapter()
+
+        adapter._enqueue_text_event(_make_event("straggler", Platform.WECOM))
+        key = next(iter(adapter._pending_text_batches))
+        task = adapter._pending_text_batch_tasks[key]
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task  # settle before shutdown, mimicking an already-finished timer
+
+        await adapter.cancel_background_tasks()
+
+        payload = next(p for p in _spool_payloads() if p.get("session_key") == key)
+        assert "straggler" in json.dumps(payload["data"])
