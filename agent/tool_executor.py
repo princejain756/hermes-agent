@@ -1169,6 +1169,12 @@ def _commit_tool_result(
                 tool_message["display_metadata"] = metadata
         except Exception as callback_error:
             logging.debug("Tool result metadata callback error: %s", callback_error)
+    # The live ``tool.complete`` payload carries ``duration_s`` but nothing persists it, so a
+    # transcript rebuilt from history loses every tool's timing. Stamp it on the row for the
+    # same reload path ``display_metadata`` already gives reactions and inline diffs.
+    display_meta = dict(tool_message.get("display_metadata") or {})
+    display_meta["duration_s"] = round(tool_duration, 3)
+    tool_message["display_metadata"] = display_meta
     stamp_data_use(tool_message, sorted(data_use))
     messages.append(tool_message)
     if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):

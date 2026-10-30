@@ -536,6 +536,42 @@ def test_connector_data_use_rides_the_tool_message_and_survives_a_reload(tmp_pat
 
 
 @pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
+def test_tool_duration_persists_on_the_row_and_survives_a_reload(tmp_path, executor_mode):
+    """Regression for #146943: the live ``tool.complete`` event carries ``duration_s`` but the
+    row stored in ``messages`` kept nothing, so a transcript rebuilt from REST lost every
+    tool's timing. The measured duration must ride ``display_metadata`` on the tool row."""
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = f"tool-duration-{executor_mode}"
+    db = _attach_real_session_db(agent, db_path, session_id)
+    messages = [{"role": "user", "content": "inspect the repository"},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "timed-call", "type": "function",
+                     "function": {"name": "web_search", "arguments": "{}"}}]}]
+    agent._flush_messages_to_session_db(messages)
+
+    dispatch_patch = (
+        patch("model_tools.handle_function_call", return_value="repository result")
+        if executor_mode == "sequential"
+        else patch.object(agent, "_invoke_tool", return_value="repository result")
+    )
+    try:
+        with (dispatch_patch,
+              patch("agent.tool_executor.maybe_persist_tool_result",
+                    side_effect=lambda **kw: kw["content"])):
+            getattr(agent, f"_execute_tool_calls_{executor_mode}")(
+                SimpleNamespace(content="", tool_calls=[_mock_tool_call(call_id="timed-call")]),
+                messages, "task-1")
+    finally:
+        db.close()
+
+    durable = _durable_messages(db_path, session_id)
+    assert durable[-1]["role"] == "tool"
+    duration = (durable[-1].get("display_metadata") or {}).get("duration_s")
+    assert isinstance(duration, (int, float)) and duration >= 0
+
+
+@pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
 def test_failed_tool_result_persist_blocks_completion_projection(executor_mode):
     agent = _make_agent()
     tool_call = _mock_tool_call(call_id="failed-persist")
