@@ -1437,6 +1437,40 @@ class TestSenderAuthentication(unittest.TestCase):
         )
         self.assertTrue(ok, reason)
 
+    def test_authserv_id_lists_and_wildcards(self):
+        """Providers that rotate receiving MTAs pin a comma-separated id list or a ``*.`` wildcard
+        (#146956). The wildcard anchors on a dot boundary; an exact pin still refuses siblings."""
+        stamp = "dmarc=pass header.from=example.com"
+        # Comma-separated ids: any listed receiving MTA is authoritative.
+        for topmost in ("mx2.pub.mail.example.com", "mx4.pub.mail.example.com"):
+            ok, reason = self._verify(
+                "admin@example.com", [f"{topmost}; {stamp}"],
+                authserv_id="mx1.pub.mail.example.com, mx2.pub.mail.example.com, "
+                           "mx3.pub.mail.example.com, mx4.pub.mail.example.com")
+            self.assertTrue(ok, (topmost, reason))
+        # An unlisted sibling is still rejected under a list pin.
+        ok, reason = self._verify(
+            "admin@example.com", [f"mx9.pub.mail.example.com; {stamp}"],
+            authserv_id="mx1.pub.mail.example.com,mx2.pub.mail.example.com")
+        self.assertFalse(ok, reason)
+        # Wildcard accepts sibling hosts under the suffix...
+        for topmost in ("mx1.pub.mail.example.com", "mx7.pub.mail.example.com"):
+            ok, reason = self._verify(
+                "admin@example.com", [f"{topmost}; {stamp}"],
+                authserv_id="*.pub.mail.example.com")
+            self.assertTrue(ok, (topmost, reason))
+        # ...but never a suffix-squatting or unrelated host.
+        for topmost in ("evil-pub.mail.example.com", "pub.mail.example.com.evil.test", "other.example.com"):
+            ok, reason = self._verify(
+                "admin@example.com", [f"{topmost}; {stamp}"],
+                authserv_id="*.pub.mail.example.com")
+            self.assertFalse(ok, (topmost, reason))
+        # Exact pins are unchanged: a child id does not satisfy an exact parent pin.
+        ok, reason = self._verify(
+            "admin@example.com", [f"child.mx.ourserver.com; {stamp}"],
+            authserv_id="mx.ourserver.com")
+        self.assertFalse(ok, reason)
+
 
 def test_oversized_cron_output_is_delivered_as_one_whole_email():
     """No 4000-char truncation footer pointing at a file on the gateway host: the router hands
