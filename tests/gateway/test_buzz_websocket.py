@@ -793,3 +793,110 @@ async def test_ws_discovery_task_cancelled_when_connection_exits(monkeypatch):
 
     assert started, "discovery task was never started with the connection"
     assert all(t.done() for t in started), "discovery task outlived its connection"
+
+
+@pytest.mark.asyncio
+async def test_quiet_subscription_stays_connected_while_pongs_flow(monkeypatch, caplog):
+    """#146894: a data-quiet subscription whose relay still answers control frames is
+    healthy — the idle read bound must verify liveness before cycling the socket.
+
+    The receive parks forever (no DATA frames), but ``ping()`` resolves: every idle window
+    the liveness probe succeeds and the same socket keeps serving. Previously the loop
+    tore the connection down every ``_WS_READ_IDLE_TIMEOUT`` seconds anyway.
+    """
+    import logging
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_PROBE_TIMEOUT", 0.05, raising=False)
+    caplog.set_level(logging.WARNING)
+    states = []
+    monkeypatch.setattr(adapter, "_write_runtime_status_safe", lambda status, **kw: states.append(kw["platform_state"]))
+
+    sockets = []
+    probes = []
+
+    async def quiet_anext():
+        await asyncio.Event().wait()
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(quiet_anext)
+
+        async def ping(data=None):
+            probes.append(1)
+            loop = asyncio.get_event_loop()
+            fut = loop.create_future()
+            fut.set_result(0.0)
+            return fut
+
+        ws.ping = ping
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        # Several idle windows must pass under probe-verified liveness, not just one.
+        from tests.waiting import async_wait_until
+        await async_wait_until(lambda: len(probes) >= 3, timeout=5.0,
+                               what="liveness probes to answer several idle windows")
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+
+    assert len(sockets) == 1, f"quiet live socket was cycled ({len(sockets)} connections)"
+    assert not any("went silent" in record.message for record in caplog.records)
+    assert "retrying" not in states
+
+
+@pytest.mark.asyncio
+async def test_idle_read_reconnects_when_the_pong_never_comes(monkeypatch):
+    """The safeguard still fires: control traffic gone too means dead (#98097).
+
+    Same parked receive as the quiet test, but ``ping()``'s pong-waiter never resolves —
+    the CLOSE_WAIT shape the read bound exists for. The probe failing must run the normal
+    reconnect path, not park forever on a quiet-looking corpse.
+    """
+    adapter = _make_adapter()
+    monkeypatch.setattr(_buzz_mod, "_WS_READ_IDLE_TIMEOUT", 0.05)
+    monkeypatch.setattr(_buzz_mod, "_WS_LIVENESS_PROBE_TIMEOUT", 0.05, raising=False)
+
+    sockets = []
+
+    async def dead_anext():
+        await asyncio.Event().wait()
+
+    def fake_connect(*args, **kwargs):
+        ws = _ScriptedWebSocket(dead_anext)
+
+        async def ping(data=None):
+            return asyncio.Event().wait()  # coroutine: no pong ever arrives
+
+        ws.ping = ping
+        sockets.append(ws)
+        return ws
+
+    import websockets as _ws_mod
+
+    monkeypatch.setattr(_ws_mod, "connect", fake_connect)
+
+    task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        deadline = time.monotonic() + 5.0
+        while len(sockets) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+    finally:
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5.0)
+        except (TimeoutError, asyncio.CancelledError):
+            pass
+
+    assert len(sockets) >= 2, "a dead read with no control liveness must still reconnect"
+    assert sockets[0].exited, "the dead connection was not closed before reconnecting"

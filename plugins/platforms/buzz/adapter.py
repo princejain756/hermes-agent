@@ -146,6 +146,10 @@ _WS_AUTH_TIMEOUT = 20.0
 # close the transport never surfaces (observed as a CLOSE_WAIT socket with the loop parked on recv, #98097)
 # leaves the gateway "connected" while inbound stops; this timeout forces the normal reconnect path instead.
 _WS_READ_IDLE_TIMEOUT = 300.0
+# A data-quiet window is not a dead socket: control frames still flow on a healthy quiet
+# subscription (#146894). When the read bound trips, one protocol ping decides — a pong means
+# "quiet", silence means the CLOSE_WAIT/stuck-reader case the bound exists for (#98097).
+_WS_LIVENESS_PROBE_TIMEOUT = 30.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100  # Buzz channel-membership event — live DM discovery
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
@@ -1155,16 +1159,24 @@ class BuzzAdapter(BuzzCursorMixin, BasePlatformAdapter):
         while True:
             read_task = asyncio.ensure_future(frame_iter.__anext__())
             try:
-                done, _ = await asyncio.wait(
-                    {read_task}, timeout=_WS_READ_IDLE_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
-                )
-                if not done:
+                while True:
+                    done, _ = await asyncio.wait(
+                        {read_task}, timeout=_WS_READ_IDLE_TIMEOUT, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if done:
+                        break
                     # wait_for() cancels and then waits for its awaitable to acknowledge the cancellation.
                     # A transport receive stuck below asyncio can ignore that cancellation forever, leaving the
-                    # adapter healthy-looking. Detach the read instead so the outer loop can close and reconnect.
-                    raise ConnectionError(
-                        f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s; assuming the connection went silent"
-                    )
+                    # adapter healthy-looking. Detach the read instead so the outer loop can close and reconnect —
+                    # but only when control traffic has ALSO stopped answering (#146894): a quiet subscription
+                    # whose relay still pongs is healthy, so the read re-arms instead of cycling a live socket.
+                    try:
+                        await asyncio.wait_for(await websocket.ping(), timeout=_WS_LIVENESS_PROBE_TIMEOUT)
+                    except Exception as exc:
+                        raise ConnectionError(
+                            f"no WebSocket frame for {_WS_READ_IDLE_TIMEOUT:.0f}s and no pong to a "
+                            "liveness probe; assuming the connection went silent"
+                        ) from exc
                 raw = read_task.result()
             except StopAsyncIteration:
                 # A clean relay close is still a disconnect: raising sends it through the same
