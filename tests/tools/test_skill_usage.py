@@ -613,3 +613,63 @@ def test_skill_file_lock_is_reentrant_in_thread_and_exclusive_across_threads(tmp
         assert not other_done.wait(timeout=0.2), "second thread acquired a held lock"
     t.join(timeout=2)
     assert entered.is_set() and other_done.is_set()
+
+
+# ---------------------------------------------------------------------------
+# #146867 — bundled classification survives a missing manifest entry, and a
+# nested copy inside a skill dir is never a second skill
+# ---------------------------------------------------------------------------
+
+
+def _bundled_source(tmp_path, monkeypatch):
+    """A fake bundled source tree (env-override seam) carrying one skill."""
+    src = tmp_path / "bundled-src"
+    _write_skill(src, "bundled-x", category="cat")
+    monkeypatch.setenv("HERMES_BUNDLED_SKILLS", str(src))
+    return src
+
+
+def test_bundled_name_classifies_without_manifest_entry(skills_home, tmp_path, monkeypatch):
+    """Regression for #146867: a bundled-named skill dir present in the store is bundled even when
+    .bundled_manifest lacks the entry — the source tree is authoritative, so the curator can never
+    read it as agent-created."""
+    _bundled_source(tmp_path, monkeypatch)
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "bundled-x", category="cat")  # on disk, but no manifest written
+    import tools.skill_usage as su
+
+    assert su.is_bundled("bundled-x")
+    assert not su.is_agent_created("bundled-x")
+    assert not su.is_curation_eligible("bundled-x")
+    assert "bundled-x" not in su.list_agent_created_skill_names()
+    ok, msg = su.archive_skill("bundled-x")
+    assert not ok and "bundled" in msg
+
+
+def test_nested_skill_copy_is_not_a_second_skill(skills_home):
+    """A skill dir containing a copy of itself is a broken layout: scanners see only the outer
+    package and _find_skill_dir resolves it."""
+    skills_dir = skills_home / "skills"
+    outer = _write_skill(skills_dir, "self-copy", category="cat")
+    _write_skill(outer, "self-copy", category="cat")  # nested duplicate inside its own dir
+    import tools.skill_usage as su
+    from agent.skill_utils import iter_skill_index_files
+
+    found = list(iter_skill_index_files(skills_dir, "SKILL.md"))
+    assert found == [outer / "SKILL.md"]
+    assert [name for name, _md in su._iter_skill_mds(skills_dir, local_only=False)] == ["self-copy"]
+    assert su._find_skill_dir("self-copy") == outer
+
+
+def test_nested_skill_copy_with_foreign_name_is_not_indexed(skills_home):
+    """A nested SKILL.md carrying a DIFFERENT frontmatter name is still part of the outer package —
+    it must not register as a phantom agent-created skill."""
+    skills_dir = skills_home / "skills"
+    outer = _write_skill(skills_dir, "outer-skill", category="cat")
+    _write_skill(outer / "cat", "stray-skill")  # nested under the skill root, different name
+    import tools.skill_usage as su
+
+    names = {name for name, _md in su._iter_skill_mds(skills_dir, local_only=False)}
+    assert names == {"outer-skill"}
+    assert su._find_skill_dir("stray-skill") is None
+    assert "stray-skill" not in {r["name"] for r in su.usage_report()}

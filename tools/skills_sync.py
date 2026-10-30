@@ -24,7 +24,7 @@ for _stream in (sys.stdout, sys.stderr):
         with suppress(ValueError, TypeError):
             _stream.reconfigure(encoding="utf-8", errors="replace")
 from hermes_constants import get_bundled_skills_dir, get_hermes_home, get_optional_skills_dir
-from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path
+from agent.skill_utils import ESSENTIAL_SKILLS, is_excluded_skill_path, is_nested_skill_md
 from tools.skill_usage import read_skill_name
 from tools.skills_sync_optional import (
     _backfill_optional_provenance, _ignore_runtime_cache, _is_runtime_cache, _read_hub_install_paths,
@@ -88,7 +88,7 @@ def _iter_skill_mds(root: Path, sort: bool = False) -> Iterator[Path]:
     """Yield every non-excluded SKILL.md under ``root`` (nothing when it does not exist)."""
     found = root.rglob("SKILL.md") if root.exists() else iter(())
     for skill_md in sorted(found) if sort else found:
-        if not is_excluded_skill_path(skill_md):
+        if not (is_excluded_skill_path(skill_md) or is_nested_skill_md(skill_md, root)):
             yield skill_md
 
 

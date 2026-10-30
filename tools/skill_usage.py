@@ -16,8 +16,10 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
+from functools import lru_cache
+
 from hermes_constants import get_hermes_home
-from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from agent.skill_utils import is_excluded_skill_path, is_external_skill_path, is_nested_skill_md
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -152,6 +154,30 @@ def _read_bundled_names() -> set[str]:
     return {n for n in (line.split(":", 1)[0].strip() for line in lines) if n} | read_suppressed_names()
 
 
+@lru_cache(maxsize=4)
+def _bundled_source_names_cached(bundled_dir_str: str) -> frozenset:
+    """Frontmatter names in one bundled source tree, cached per dir (install content is static per run)."""
+    bundled_dir = Path(bundled_dir_str)
+    return frozenset(
+        read_skill_name(md, md.parent.name)
+        for md in bundled_dir.rglob("SKILL.md")
+        if not (is_excluded_skill_path(md.relative_to(bundled_dir), root=bundled_dir)
+                or is_nested_skill_md(md, bundled_dir)))
+
+
+def _bundled_source_names() -> set[str]:
+    """Frontmatter names in the bundled SOURCE tree — the authoritative built-in set (#146867). The sync
+    manifest only records what sync placed; a bundled-named skill on disk is still bundled when that
+    entry is absent (partial sync, hand-seeded tree, catalog churn). Empty when unreadable/absent."""
+    try:
+        from hermes_constants import get_bundled_skills_dir
+        bundled_dir = get_bundled_skills_dir(Path(__file__).parent.parent / "skills")
+        return set(_bundled_source_names_cached(str(bundled_dir))) if bundled_dir.exists() else set()
+    except Exception as e:
+        logger.debug("Failed to read bundled skills source tree: %s", e, exc_info=True)
+        return set()
+
+
 def _read_hub_installed_names() -> set[str]:
     """Hub-installed names (``.hub/lock.json``) plus the frontmatter name of each in-tree ``install_path``."""
     skills_dir = _skills_dir()
@@ -216,7 +242,8 @@ def _iter_skill_mds(base: Path, *, local_only: bool) -> Iterator[tuple[str, Path
     """``(frontmatter name, SKILL.md)`` under *base* minus metadata/VCS/venv/cache dirs; *local_only* also skips
     external skill dirs mounted below the tree (curation must not touch them)."""
     for skill_md in base.rglob("SKILL.md"):
-        if not (is_excluded_skill_path(skill_md) or (local_only and is_external_skill_path(skill_md))):
+        if not (is_excluded_skill_path(skill_md) or is_nested_skill_md(skill_md, base)
+                or (local_only and is_external_skill_path(skill_md))):
             yield read_skill_name(skill_md, fallback=skill_md.parent.name), skill_md
 
 
@@ -224,7 +251,7 @@ def _scan_local_skills(keep: Callable[[str, Path, set[str], dict[str, Any]], boo
     """Sorted local skill names passing *keep(name, skill_md, bundled, usage)*; hub/protected names never reach it."""
     if not (base := _skills_dir()).exists():
         return []
-    hub, bundled, usage = _read_hub_installed_names(), _read_bundled_names(), load_usage()
+    hub, bundled, usage = _read_hub_installed_names(), _read_bundled_names() | _bundled_source_names(), load_usage()
     return sorted({name for name, skill_md in _iter_skill_mds(base, local_only=True)
                    if name not in hub and not is_protected_builtin(name) and keep(name, skill_md, bundled, usage)})
 
@@ -268,7 +295,7 @@ def is_hub_installed(skill_name: str) -> bool:
 
 
 def is_bundled(skill_name: str) -> bool:
-    return skill_name in _read_bundled_names()
+    return skill_name in _read_bundled_names() or skill_name in _bundled_source_names()
 
 
 def _external_read_only_message(skill_name: str) -> str:

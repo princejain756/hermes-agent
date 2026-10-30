@@ -52,6 +52,19 @@ def is_skill_support_path(path, *, root: Optional[Path] = None) -> bool:
     )
 
 
+def is_nested_skill_md(skill_md, root: Optional[Path] = None) -> bool:
+    """True if *skill_md* sits inside another skill package under *root* — an ancestor dir between
+    *root* (exclusive) and the file's parent (exclusive) already holds a SKILL.md. A skill dir
+    containing a copy of a skill (itself or another) is a broken layout, never a second skill."""
+    path_obj = skill_md if isinstance(skill_md, Path) else Path(str(skill_md))
+    base = Path(root) if root is not None else Path()
+    try:
+        rel_parts = path_obj.parent.relative_to(base).parts if base.parts else path_obj.parent.parts
+    except ValueError:
+        return False
+    return any((base / Path(*rel_parts[:i]) / "SKILL.md").exists() for i in range(1, len(rel_parts)))
+
+
 _yaml_load_fn = None
 
 
@@ -875,9 +888,14 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     """Walk skills_dir yielding sorted paths matching *filename*; prunes
     EXCLUDED_SKILL_DIRS and support dirs of skill roots."""
     matches: list[str] = []
+    scan_root = Path(skills_dir)
     for root, dirs, files in os.walk(str(skills_dir), followlinks=True):
         has_skill_md = "SKILL.md" in files
-        dirs[:] = [d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
+        # A package dir is a leaf: nothing below it is a separate skill. Support dirs were already
+        # skipped; any deeper SKILL.md is a stray nested copy, never a second skill (#146867). A
+        # SKILL.md sitting at the scan root itself still counts without suppressing packages below.
+        dirs[:] = [] if has_skill_md and Path(root) != scan_root else [
+            d for d in dirs if d not in EXCLUDED_SKILL_DIRS and not (has_skill_md and d in SKILL_SUPPORT_DIRS)]
         if filename in files:
             matches.append(os.path.join(root, filename))
     yield from map(Path, sorted(matches))
