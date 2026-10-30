@@ -415,7 +415,7 @@ class TestTelegramGateIsolation:
 
     def test_telegram_yaml_bridge_skipped_for_scoped_profile(self, monkeypatch):
         from agent import secret_scope
-        from plugins.platforms.telegram.adapter import _apply_yaml_config
+        from plugins.platforms.telegram.telegram_yaml_config import _apply_yaml_config
 
         monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
         monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)

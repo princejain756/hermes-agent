@@ -166,7 +166,7 @@ async def test_opt_in_root_dm_command_stays_in_the_lobby(tmp_path, monkeypatch):
 def test_top_level_telegram_yaml_key_reaches_extra(monkeypatch):
     """``telegram: dm_topic_auto_transfer: true`` (top-level YAML) lands in PlatformConfig.extra,
     like its neighbour ``disable_topic_auto_rename``."""
-    from plugins.platforms.telegram.adapter import _apply_yaml_config
+    from plugins.platforms.telegram.telegram_yaml_config import _apply_yaml_config
 
     extras = _apply_yaml_config({}, {"dm_topic_auto_transfer": True}) or {}
     assert extras.get("dm_topic_auto_transfer") is True

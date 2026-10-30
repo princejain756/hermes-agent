@@ -148,6 +148,16 @@ def profile_scoped() -> bool:
 # (apply_yaml_config_fn, #25443)
 # ---------------------------------------------------------------------------
 
+_YAML_BRIDGED_ENV: dict[str, str] = {}
+"""env name → the value the YAML bridge itself wrote. Distinguishes a stale bridged value —
+safe for a gate refresh to update or retract — from an explicit override, which keeps winning
+under the documented env-over-YAML contract (#146870)."""
+
+
+def _render_env_value(value: Any) -> str:
+    return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
+
+
 def yaml_env_setter() -> Callable[[str, Any], None]:
     """``set_env(name, value)`` for ``apply_yaml_config_fn`` hooks: writes ``os.environ[name]`` only
     when the var is unset (explicit env wins over YAML) and NEVER while a multiplexed secondary
@@ -162,9 +172,80 @@ def yaml_env_setter() -> Callable[[str, Any], None]:
     def set_env(name: str, value: Any) -> None:
         if value is None or skip or os.getenv(name):
             return
-        os.environ[name] = ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
+        os.environ[name] = _YAML_BRIDGED_ENV[name] = _render_env_value(value)
 
     return set_env
+
+
+def refresh_bridged_env(name: str, value: Any) -> bool:
+    """Re-derive a bridge-written env var after its YAML key changed: update to the new value, or
+    retract when the key left the file. An env value the bridge did not write — or one that
+    changed since the write (an explicit override) — stays authoritative. True when it moved."""
+    recorded = _YAML_BRIDGED_ENV.get(name)
+    if recorded is None or os.getenv(name) != recorded:
+        return False
+    if value is None:
+        os.environ.pop(name, None)
+        _YAML_BRIDGED_ENV.pop(name, None)
+    else:
+        os.environ[name] = _YAML_BRIDGED_ENV[name] = _render_env_value(value)
+    return True
+
+
+def _gate_yaml_owner_home(adapter: Any):
+    """The config.yaml home an adapter-level gate refresh reads: the owning multiplex profile's
+    dir, else the launch profile's home (``None`` when a named home no longer resolves)."""
+    owner = getattr(adapter, "_owner_profile", None)
+    if isinstance(owner, str) and owner.strip():
+        try:
+            from hermes_cli.profiles import get_profile_dir
+            return get_profile_dir(owner.strip())
+        except Exception:
+            logger.debug("gate refresh: profile home for %r unresolved", owner, exc_info=True)
+            return None
+    from hermes_constants import get_hermes_home
+    return get_hermes_home()
+
+
+def refresh_yaml_gate(adapter: Any, *, section: str, spec: dict[str, str], attr: str) -> None:
+    """Re-derive adapter-level authorization keys from the owning profile's persisted config.yaml
+    once the file's signature changes — a per-message ``os.stat`` is the only steady-state cost,
+    so admission reads the policy the file actually holds instead of the construction-time copy
+    (#146870). ``spec`` maps each refreshed YAML key to the env name its ``apply_yaml_config_fn``
+    bridge may have written. ``config.extra`` tracks the loader's merge (top-level keys, then
+    ``extra:`` winning on a clash); the env rung moves only where the bridge wrote it, so an
+    explicit env override keeps precedence. A missing or unparseable file keeps the current
+    policy — a refresh never widens access on a bad read.
+    """
+    home = _gate_yaml_owner_home(adapter)
+    if home is None:
+        return
+    from hermes_cli.config_backend import config_version_or_none
+    signature = config_version_or_none(home / "config.yaml")
+    if signature is None or getattr(adapter, attr, None) == signature:
+        return
+    setattr(adapter, attr, signature)
+    try:
+        from gateway.session_local import profile_env_scope
+        from hermes_cli.config_effective import load_user_config_effective
+        with profile_env_scope(home):
+            cfg = load_user_config_effective(home / "config.yaml")
+        block = cfg.get(section) if isinstance(cfg, dict) else None
+        if not isinstance(block, dict):
+            return
+        nested = block.get("extra") if isinstance(block.get("extra"), dict) else {}
+        extra = getattr(adapter.config, "extra", None)
+        for key, env in spec.items():
+            value = nested.get(key, block.get(key))
+            if isinstance(extra, dict):
+                if value is None:
+                    extra.pop(key, None)
+                else:
+                    extra[key] = value
+            refresh_bridged_env(env, value)
+    except Exception:
+        logger.debug("[%s] config gate refresh skipped; keeping current policy",
+                     getattr(adapter, "name", "?"), exc_info=True)
 
 
 def send_error(message: Any) -> dict:

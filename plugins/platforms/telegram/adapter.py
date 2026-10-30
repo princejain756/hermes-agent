@@ -187,6 +187,7 @@ from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, 
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
+from plugins.platforms.telegram.telegram_yaml_config import refresh_telegram_group_gate
 from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -6426,6 +6427,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             return False
         # Resolve once; _message_mentions_bot is not re-called below in guest mode.
         guest_mention = self._is_guest_mention(message)
+        # Group allowlists persisted to config.yaml take effect without a restart (#146870).
+        refresh_telegram_group_gate(self)
         # allowed_chats whitelist: outside chats pass only via the guest-mode explicit mention.
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
@@ -7282,86 +7285,10 @@ def interactive_setup() -> None:
     setup_platforms._setup_telegram()
 
 
-def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
-    """Translate config.yaml telegram: keys into TELEGRAM_* env vars and PlatformConfig.extra. Env vars
-    take precedence over YAML. Returns extras to merge into PlatformConfig.extra, or None.
-
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy telegram_cfg block from
-    gateway/config.py::load_gateway_config().
-    """
-    import json as _json
-    from gateway.platforms._shared import yaml_env_setter
-    extras: dict = {}
-    # Under multiplex a secondary profile's settings must NOT hit the process-global env (first-writer-wins
-    # would pin them for every profile, #72348); yaml_env_setter skips the write under its scope and the
-    # values flow via extra/secret scope instead.
-    _set_env = yaml_env_setter()
-
-    def _bridge_lower(key: str, env: str) -> None:
-        if key in telegram_cfg:
-            extras.setdefault(key, telegram_cfg[key])
-            _set_env(env, str(telegram_cfg[key]).lower())
-
-    def _bridge_gate(key: str, env: str, value: Any, *, seed_extra: bool = False) -> None:
-        """CSV allowlist gate: list → comma-joined; env write skipped under multiplex secret scope."""
-        if value is None:
-            return
-        if seed_extra:
-            extras.setdefault(key, value)
-        _set_env(env, value)
-
-    for _topic_key in ("disable_topic_auto_rename", "dm_topic_auto_transfer"):
-        if _topic_key in telegram_cfg:
-            extras.setdefault(_topic_key, telegram_cfg[_topic_key])
-    _effective_rm = telegram_cfg.get("require_mention", yaml_cfg.get("require_mention"))
-    if _effective_rm is not None:
-        _set_env("TELEGRAM_REQUIRE_MENTION", str(_effective_rm).lower())
-    if "mention_patterns" in telegram_cfg:
-        _set_env("TELEGRAM_MENTION_PATTERNS", _json.dumps(telegram_cfg["mention_patterns"]))
-    for key, env in (
-        ("exclusive_bot_mentions", "TELEGRAM_EXCLUSIVE_BOT_MENTIONS"), ("allow_bots", "TELEGRAM_ALLOW_BOTS"),
-        ("bots_require_mention", "TELEGRAM_BOTS_REQUIRE_MENTION"),
-        ("guest_mode", "TELEGRAM_GUEST_MODE", ), ("observe_unmentioned_group_messages", "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES")):
-        _bridge_lower(key, env)
-    # No extras seed for allowed_chats / allowed_topics / group_allowed_chats: the shared-key loop already
-    # bridges them with their original type and this merge would clobber it.
-    for key, env, seed in (
-        ("free_response_chats", "TELEGRAM_FREE_RESPONSE_CHATS", True), ("free_response_topics", "TELEGRAM_FREE_RESPONSE_TOPICS", False),
-        ("allowed_chats", "TELEGRAM_ALLOWED_CHATS", False), ("allowed_topics", "TELEGRAM_ALLOWED_TOPICS", False),
-        ("ignored_threads", "TELEGRAM_IGNORED_THREADS", True)):
-        _bridge_gate(key, env, telegram_cfg.get(key), seed_extra=seed)
-    _bridge_lower("reactions", "TELEGRAM_REACTIONS")
-    if "proxy_url" in telegram_cfg:
-        # Seeded into extra so ``_build_ptb_requests`` keeps a secondary's route without the env bridge.
-        extras.setdefault("proxy_url", str(telegram_cfg["proxy_url"]).strip())
-        _set_env("TELEGRAM_PROXY", str(telegram_cfg["proxy_url"]).strip())
-    _telegram_extra = telegram_cfg.get("extra") if isinstance(telegram_cfg.get("extra"), dict) else {}
-    _telegram_rtm = telegram_cfg["reply_to_mode"] if "reply_to_mode" in telegram_cfg else _telegram_extra.get("reply_to_mode")
-    if _telegram_rtm is not None:
-        _set_env("TELEGRAM_REPLY_TO_MODE", "off" if _telegram_rtm is False else str(_telegram_rtm).lower())
-    _bridge_gate("allow_from", "TELEGRAM_ALLOWED_USERS", telegram_cfg.get("allow_from"))
-    _bridge_gate("group_allow_from", "TELEGRAM_GROUP_ALLOWED_USERS", telegram_cfg.get("group_allow_from") or _telegram_extra.get("group_allow_from"))
-    _bridge_gate(
-        "group_allowed_chats", "TELEGRAM_GROUP_ALLOWED_CHATS",
-        telegram_cfg.get("group_allowed_chats") or _telegram_extra.get("group_allowed_chats"))
-    for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages", "free_response_topics"):
-        if _key in telegram_cfg:
-            extras.setdefault(_key, telegram_cfg[_key])
-    # Pass through telegram-specific extra keys but EXCLUDE generic shared-config keys: _merge_platform_map
-    # already applied top-level-over-nested precedence and re-emitting them via dict.update() would undo it.
-    _GENERIC_MERGE_KEYS = {
-        "reply_prefix", "reply_in_thread", "reply_to_mode", "unauthorized_dm_behavior", "notice_delivery",
-        "require_mention", "channel_skill_bindings", "channel_prompts", "gateway_restart_notification", "allow_from",
-        "allow_admin_from", "dm_policy", "group_policy"}
-    for _k, _v in _telegram_extra.items():
-        if _k not in _GENERIC_MERGE_KEYS:
-            extras.setdefault(_k, _v)
-    return extras or None
-
-
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     from .adapter_hint import PLATFORM_HINT
+    from .telegram_yaml_config import _apply_yaml_config
     from .dashboard_card import DASHBOARD_CARD
     from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
