@@ -1511,10 +1511,11 @@ class GatewayAdapterLifecycleMixin:
                     # release partial resources and return its held inbound; stop only for a non-retryable fatal.
                     await self._safe_adapter_disconnect(adapter, platform)
                     hand_over_held_inbound(adapter, predecessor)
-                    if success or (
-                        getattr(adapter, "has_fatal_error", False)
+                    non_retryable = getattr(adapter, "has_fatal_error", False) \
                         and not getattr(adapter, "fatal_error_retryable", True)
-                    ):
+                    if success or non_retryable:
+                        if not success:  # terminal rebuild failure: park visibly (#146909)
+                            self._mark_platform_fatal(f"{profile_name}:{platform.value}", adapter)
                         return
                 except BaseException as exc:
                     if adapter is not None:
@@ -1600,8 +1601,11 @@ class GatewayAdapterLifecycleMixin:
     def _schedule_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform, adapter: BasePlatformAdapter
     ) -> None:
-        """Schedule one runner-owned reconnect without sharing primary secrets."""
-        if not self._running or not adapter.fatal_error_retryable:
+        """Schedule one runner-owned reconnect without sharing primary secrets. A non-retryable
+        fatal is admitted as one pass too: the primary's recovery for those is process restart,
+        which a dead secondary never gets (#146909); the loop below parks a terminally-failing
+        replacement on its own."""
+        if not self._running:
             return
         pending = self._profile_failed_platforms
         if not isinstance(pending, dict):
@@ -1632,6 +1636,14 @@ class GatewayAdapterLifecycleMixin:
             )
             return
         profile_map.pop(platform, None)
+        # Mirror the primary's fatal-status write under ``<profile>:<platform>`` (#146909): nothing
+        # else updates that key on a mid-run secondary fatal, so the profile otherwise keeps
+        # reporting its last state — usually "connected" — while dead.
+        self._update_platform_runtime_status(
+            f"{profile_name}:{platform.value}",
+            platform_state="retrying" if adapter.fatal_error_retryable else "fatal",
+            error_code=adapter.fatal_error_code, error_message=adapter.fatal_error_message,
+        )
         # The notification may arrive outside the profile's scope: the row is that profile's.
         if (profile_home := self._routed_profile_home(profile_name)) is not UNRESOLVED_PROFILE_HOME:
             record_platform_disconnect(adapter, hermes_home=profile_home)

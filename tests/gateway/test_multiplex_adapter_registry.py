@@ -408,6 +408,63 @@ class TestSecondaryProfileFatalRecovery:
         assert redelivery_homes
         assert all(path != Path("/profiles/reviewer") for path in redelivery_homes)
 
+    @pytest.mark.asyncio
+    async def test_non_retryable_secondary_fatal_gets_a_reconnect_pass(self, monkeypatch):
+        """#146909: a secondary adapter's terminal fatal (telegram_polling_conflict after a stall
+        rebuild — usually the gateway's own expiring session) still gets a reconnect pass; the
+        primary's recovery for a non-retryable fatal is process restart, which restarts nothing
+        for a secondary inside a live gateway."""
+        runner = _secondary_recovery_runner()
+        stale = _SecondaryRecoveryAdapter(retryable=False)
+        replacement = _SecondaryRecoveryAdapter()
+        runner._profile_adapters["reviewer"] = {Platform.DISCORD: stale}
+        _install_secondary_reconnect_context(monkeypatch, runner, replacement)
+        statuses = []
+        monkeypatch.setattr(
+            runner, "_update_platform_runtime_status",
+            lambda key, **kw: statuses.append((key, kw)))
+
+        async def connect(adapter, platform, *, is_reconnect=False):
+            return True
+
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", connect)
+        await runner._handle_profile_adapter_fatal_error("reviewer", Platform.DISCORD, stale)
+
+        assert len(runner._background_tasks) == 1  # the bug: the pass was never scheduled
+        await asyncio.gather(*runner._background_tasks)
+
+        assert runner._profile_adapters["reviewer"][Platform.DISCORD] is replacement
+        assert ("reviewer:discord", {
+            "platform_state": "fatal",
+            "error_code": "auth_failed",
+            "error_message": "Gateway transport stale",
+        }) in statuses
+
+    @pytest.mark.asyncio
+    async def test_terminal_rebuild_failure_parks_secondary_visibly(self, monkeypatch):
+        """The pass is bounded: a replacement that fails terminally marks the profile fatal —
+        not a stale "connected" — and does not loop."""
+        runner = _secondary_recovery_runner()
+        stale = _SecondaryRecoveryAdapter(retryable=False)
+        replacement = _SecondaryRecoveryAdapter(retryable=False)
+        replacement.has_fatal_error = True
+        runner._profile_adapters["reviewer"] = {Platform.DISCORD: stale}
+        _install_secondary_reconnect_context(monkeypatch, runner, replacement)
+        statuses = []
+        monkeypatch.setattr(
+            runner, "_update_platform_runtime_status",
+            lambda key, **kw: statuses.append((key, kw)))
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", AsyncMock(return_value=False))
+
+        await runner._handle_profile_adapter_fatal_error("reviewer", Platform.DISCORD, stale)
+        await asyncio.gather(*runner._background_tasks)
+
+        assert Platform.DISCORD not in runner._profile_adapters.get("reviewer", {})
+        assert not runner._background_tasks
+        fatal_writes = [kw for key, kw in statuses
+                        if key == "reviewer:discord" and kw.get("platform_state") == "fatal"]
+        assert len(fatal_writes) == 2  # notify-time write + terminal park write
+
 
     @pytest.mark.asyncio
     async def test_dropped_bot_is_never_swapped_for_the_primary(self, monkeypatch):
@@ -425,6 +482,8 @@ class TestSecondaryProfileFatalRecovery:
         _install_secondary_reconnect_context(monkeypatch, runner, stale)
         _stub_secondary_start(monkeypatch, runner)
         assert await runner._start_one_profile_adapters("reviewer", Path("/profiles/reviewer"), {}) == 1
+        # A dead credential makes the single non-retryable pass give up on its first attempt.
+        monkeypatch.setattr(gateway_run, "_platform_has_bot_credential", lambda *a: False)
         runner._profile_adapters["reviewer"][Platform.LOCAL] = object()
         disconnecting, release = asyncio.Event(), asyncio.Event()
 
@@ -439,6 +498,7 @@ class TestSecondaryProfileFatalRecovery:
         assert runner._adapters_for_profile("reviewer").get(Platform.DISCORD) is None
         release.set()
         await handler
+        await asyncio.gather(*runner._background_tasks)
         assert not runner._background_tasks
         assert runner._adapters_for_profile("reviewer").get(Platform.DISCORD) is None
 
