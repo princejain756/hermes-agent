@@ -143,7 +143,8 @@ def use_keyless(name: str, api_key: str) -> bool:
 def _parse_mcp_body(body: str) -> str:
     """First text content item from an MCP tools/call response — plain-JSON bodies
     (Parallel) or SSE ``data: {...}`` lines (Exa). Raises :class:`KeylessMCPError` for
-    JSON-RPC errors and ``isError`` tool results (e.g. Exa's free-tier rate limit).
+    JSON-RPC errors and ``isError`` tool results. Exa's free-tier throttle instead arrives
+    as an ordinary 200 text payload — caught vendor-side in ``_exa_call`` (#146853).
 
     SSE frames are split on the SSE line terminators (CRLF, CR, LF) only:
     ``str.splitlines()`` also breaks on U+0085 / U+2028 / U+2029, which legitimately
@@ -203,6 +204,23 @@ def mcp_call(url: str, tool: str, arguments: dict[str, Any], timeout: int = _TIM
     if response.status_code >= 400:
         raise KeylessMCPError(f"HTTP {response.status_code}: {_response_text(response)[:300]}")
     return _parse_mcp_body(_response_text(response))
+
+
+# Exa's free MCP tier intermittently answers a throttle as HTTP 200 with the notice as the
+# ordinary text payload — no JSON-RPC ``error``, no ``isError`` (#146853). Undetected it
+# surfaces as a 0-result search or the notice as page content. The notice always pairs a
+# rate-limit phrase with an Exa-specific pointer; a real page mentioning both is implausible,
+# so the match stays tight enough to never misread content.
+_EXA_THROTTLE_HINTS = ("exa api key", "exaapikey", "mcp.exa.ai", "dashboard.exa.ai")
+
+
+def _exa_call(tool: str, arguments: dict[str, Any]) -> str:
+    """``mcp_call`` against Exa plus the 200-as-throttle check."""
+    text = mcp_call(EXA_MCP_URL, tool, arguments)
+    low = text.lower()
+    if "rate limit" in low and any(hint in low for hint in _EXA_THROTTLE_HINTS):
+        raise KeylessMCPError(f"rate limit notice served as HTTP 200: {text.strip()[:200]}")
+    return text
 
 
 # --- Parallel (search.parallel.ai) — JSON text payloads -----------------------
@@ -270,13 +288,13 @@ def _parse_exa_search_text(text: str, limit: int) -> list[dict[str, Any]]:
 
 
 def exa_search_keyless(query: str, limit: int = 5) -> dict[str, Any]:
-    return _search("exa", lambda: _parse_exa_search_text(mcp_call(EXA_MCP_URL, "web_search_exa", {"query": query, "numResults": max(1, int(limit))}), limit))
+    return _search("exa", lambda: _parse_exa_search_text(_exa_call("web_search_exa", {"query": query, "numResults": max(1, int(limit))}), limit))
 
 
 def exa_extract_keyless(urls: list[str]) -> list[dict[str, Any]]:
     """Called per-URL; the tool returns one combined text payload."""
     def _fetch(url: str) -> dict[str, Any]:
-        text = mcp_call(EXA_MCP_URL, "web_fetch_exa", {"urls": [url]})
+        text = _exa_call("web_fetch_exa", {"urls": [url]})
         # Title: first markdown H1 or ``Title:`` line, whichever comes first.
         titles = (_after(s, "# " if s.startswith("# ") else "Title:") for s in map(str.strip, text.splitlines()) if s.startswith(("# ", "Title:")))
         return _page(url, next(titles, ""), text)

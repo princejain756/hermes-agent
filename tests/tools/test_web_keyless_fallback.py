@@ -710,3 +710,71 @@ class TestKeylessFailover:
         out = keyless_mcp.extract_with_failover("exa", ["https://a", "https://b"])
         assert out == partial
         assert not called
+
+
+# ---------------------------------------------------------------------------
+# #146853 — Exa's free-tier throttle arrives as a plain HTTP 200 text payload
+# ---------------------------------------------------------------------------
+
+
+_EXA_THROTTLE_NOTICE = (
+    "You've hit Exa's free MCP rate limit. To continue using without limits, "
+    "create your own Exa API key.\n\nFix: Create API key at "
+    "https://dashboard.exa.ai/api-keys , and then update Exa MCP URL to this "
+    "https://mcp.exa.ai/mcp?exaApiKey=YOUR_EXA_API_KEY"
+)
+
+
+def _exa_200_response(text):
+    """The live envelope observed in #146853: HTTP 200 SSE, notice as ordinary result text."""
+    import requests
+
+    payload = {"result": {"content": [{"type": "text", "text": text}]}}
+    response = requests.Response()
+    response.status_code = 200
+    response.headers["Content-Type"] = "text/event-stream"
+    response._content = f"event: message\ndata: {json.dumps(payload)}\n\n".encode()
+    return response
+
+
+class TestExaThrottleNotice:
+    def test_search_treats_200_throttle_notice_as_error(self):
+        """Regression for #146853: the notice lands inside ``result.content`` with no JSON-RPC
+        ``error`` and no ``isError`` — previously a "successful" search with zero parsed rows."""
+        import requests
+
+        with patch.object(requests, "post", return_value=_exa_200_response(_EXA_THROTTLE_NOTICE)):
+            result = keyless_mcp.exa_search_keyless("q")
+        assert result["success"] is False
+        assert keyless_mcp._is_rate_limitish(result["error"])
+
+    def test_extract_treats_200_throttle_notice_as_error(self):
+        """The 246-char notice was returned AS the page content of the requested URL."""
+        import requests
+
+        with patch.object(requests, "post", return_value=_exa_200_response(_EXA_THROTTLE_NOTICE)):
+            (row,) = keyless_mcp.exa_extract_keyless(["https://x.example"])
+        assert row.get("error") and keyless_mcp._is_rate_limitish(row["error"])
+        assert _EXA_THROTTLE_NOTICE not in (row.get("content") or "")
+
+    def test_200_throttle_notice_fails_over_to_next_vendor(self, monkeypatch):
+        """A rate-limit-shaped failure must advance the keyless ring, not report success."""
+        import requests
+
+        monkeypatch.setattr(keyless_mcp, "_vendor_pinned", lambda n: n == "exa")
+        monkeypatch.setitem(
+            keyless_mcp._KEYLESS_SEARCHERS, "parallel",
+            lambda q, l: {"success": True, "data": {"web": [{"url": "https://parallel.example"}]}},
+        )
+        with patch.object(requests, "post", return_value=_exa_200_response(_EXA_THROTTLE_NOTICE)):
+            out = keyless_mcp.search_with_failover("exa", "q", 3)
+        assert out["success"] is True and out["data"]["served_by"] == "parallel"
+
+    def test_short_page_mentioning_rate_limit_stays_content(self):
+        """A real page that only mentions rate limits — no Exa pointer — is not a throttle."""
+        import requests
+
+        with patch.object(requests, "post", return_value=_exa_200_response("Short page on API rate limit best practices.")):
+            (row,) = keyless_mcp.exa_extract_keyless(["https://x.example"])
+        assert not row.get("error")
+        assert "rate limit" in (row.get("content") or "").lower()
