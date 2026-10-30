@@ -43,7 +43,12 @@ def _wire(provider, base_url, model="m", rejected=()):
     ("kilocode", "https://api.kilo.ai/api/gateway", "m", {"reasoning_content", "reasoning", "reasoning_details"}),
     ("novita", "https://api.novita.ai/openai/v1", "m", {"reasoning_content", "reasoning_details"}),
     ("ollama-cloud", "https://ollama.com/v1", "m", {"reasoning_content", "reasoning"}),
+    # "custom" is local by endpoint, not by provider id: loopback/LAN keeps the dual write while a
+    # remote gateway gets only the de-facto alias — strict OpenAI-compatible gateways treat
+    # reasoning and reasoning_content as one slot and 400 when both are present (#146945).
     ("custom", "http://127.0.0.1:8080/v1", "m", {"reasoning_content", "reasoning"}),
+    ("custom", "http://192.168.1.40:8080/v1", "m", {"reasoning_content", "reasoning"}),
+    ("custom", "https://oneapi-gateway.example.com/v1", "m", {"reasoning_content"}),
     # everyone else: the de-facto standard alias
     ("zai", "https://api.z.ai/api/paas/v4", "glm-5.3", {"reasoning_content"}),
     ("openai-api", "https://api.openai.com/v1", "gpt-5", {"reasoning_content"}),

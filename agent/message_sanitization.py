@@ -669,7 +669,11 @@ _REASONING_CARRIER_ROUTES: tuple = (
     # Vendors that document reasoning_details replay next to reasoning_content.
     (frozenset({RC, RD}), frozenset({"novita", "tencent-tokenhub", "minimax", "minimax-cn"}),
      ("novita.ai", "tokenhub.tencentmaas.com", "tokenhub-intl.tencentcloudmaas.com", "minimax.io", "minimaxi.com")),
-    (_LOCAL_CARRIERS, frozenset({"ollama-cloud", "custom", "lmstudio", "upstage"}), ("ollama.com", "upstage.ai")),
+    # "custom" is deliberately absent: it is also the runtime identity of remote OpenAI-compatible
+    # gateways, and strict ones (one-api/new-api) treat reasoning + reasoning_content as one slot and
+    # 400 on both keys (#146945). Remote custom endpoints fall through to the is_local_endpoint check
+    # below, so loopback/RFC-1918 custom routes keep the dual write and remote ones get the standard alias.
+    (_LOCAL_CARRIERS, frozenset({"ollama-cloud", "lmstudio", "upstage"}), ("ollama.com", "upstage.ai")),
 )
 
 
