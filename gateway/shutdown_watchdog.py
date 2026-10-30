@@ -364,11 +364,18 @@ async def loop_heartbeat_forever(
         unix_path = get_loop_tick_socket_path(home) if os.name == "posix" else None
         if unix_path is not None and _fits_sun_path(unix_path):
             tick_socket_path = unix_path
-            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
-            _sweep_stale_tick_sockets(tick_socket_path)
-            tick_server = await asyncio.start_unix_server(_tick_socket_handler,
-                                                          path=str(tick_socket_path))
-        else:
+            try:
+                tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+                _sweep_stale_tick_sockets(tick_socket_path)
+                tick_server = await asyncio.start_unix_server(_tick_socket_handler,
+                                                              path=str(tick_socket_path))
+            except OSError as exc:
+                # A fitting path can still refuse AF_UNIX (9p/drvfs HERMES_HOME, #146919): keep the
+                # loop-scheduling witness alive on the TCP loopback the over-long-path case uses.
+                logger.warning("Loop tick unix socket unavailable at %s (%s); using TCP loopback",
+                               tick_socket_path, exc)
+                tick_socket_path = None
+        if tick_server is None:
             tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
             for _s in tick_server.sockets or []:
                 with contextlib.suppress(Exception):

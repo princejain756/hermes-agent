@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
 import os
@@ -171,3 +172,23 @@ async def test_loop_tick_witness_arms_over_tcp_on_windows(short_home, caplog):
 async def test_loop_tick_witness_arms_on_posix(short_home):
     payload = await _run_heartbeat_until_payload(short_home)
     assert payload["loop_tick_socket"] is True
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.asyncio
+async def test_loop_tick_witness_falls_back_to_tcp_when_home_refuses_unix(short_home):
+    """#146919: a HERMES_HOME on a filesystem that cannot host AF_UNIX (9p/drvfs) makes
+    ``start_unix_server`` raise EOPNOTSUPP even when the path fits sun_path. The witness
+    must still arm over the TCP loopback the non-POSIX/over-long-path cases use — losing it
+    silently disables wedged-loop detection."""
+    def _refused(*args, **kwargs):
+        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+    with patch.object(
+        shutdown_watchdog_module.asyncio, "start_unix_server", side_effect=_refused
+    ):
+        payload = await _run_heartbeat_until_payload(short_home)
+
+    assert payload["loop_tick_socket"] is True
+    assert 0 < int(payload["loop_tick_tcp_port"]) <= 65535
+    assert not list(short_home.glob("**/gateway.loop-tick.*.sock"))
