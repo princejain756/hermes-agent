@@ -288,9 +288,10 @@ class MCPServerRunMixin:
             if (config.get("transport") != "sse" and not config.get("skip_preflight")
                     and liveness_for(self.name).kind != "server_json"
                     and not self._ready.is_set() and self._auth_type != "oauth"):
+                from tools.mcp_tool_transport import _resolve_mcp_ssl_verify
                 await self._preflight_content_type(
                     config["url"], headers=dict(config.get("headers") or {}),
-                    ssl_verify=config.get("ssl_verify", True),
+                    ssl_verify=_resolve_mcp_ssl_verify(config, config["url"]),
                     client_cert=_errors._resolve_client_cert(self.name, config),
                     strict_redirect_headers=bool(config.get("strict_redirect_headers")))
         except (_errors.InvalidMcpUrlError, _errors.NonMcpEndpointError) as exc:

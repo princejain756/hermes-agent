@@ -42,6 +42,21 @@ def _present(**kwargs) -> dict:
     return {k: v for k, v in kwargs.items() if v is not None}
 
 
+def _resolve_mcp_ssl_verify(config: dict, url: str):
+    """``verify`` for every httpx client this server builds. The configured ``ssl_verify`` routes
+    through ``agent.ssl_verify.resolve_httpx_verify`` so a certifi bundle path deleted by the last
+    ``hermes pm install`` environment rotation resolves to the platform store instead of raising
+    ``FileNotFoundError`` inside httpx's own ``create_ssl_context`` at client construction (#146924).
+    ``ssl_verify: false`` keeps its insecure opt-out; a string value is an explicit CA bundle path
+    that httpx loads directly — it never resolves through certifi, so it passes through verbatim."""
+    configured = config.get("ssl_verify", True)
+    if isinstance(configured, str) and configured.strip().lower() not in {
+            "true", "false", "0", "1", "yes", "no", "on", "off"}:
+        return configured
+    from agent.ssl_verify import resolve_httpx_verify
+    return resolve_httpx_verify(ssl_verify=configured, base_url=url)
+
+
 def _mcp_proxy_mounts(httpx_mod, url: str, ssl_verify, client_cert, server_name: str = "") -> Optional[dict]:
     """Proxy transports for the caller-owned MCP HTTP client, or ``None`` for a direct connect.
 
@@ -437,7 +452,7 @@ class MCPServerTransportMixin:
     # ------------------------------------------------------------------- HTTP
 
     async def _preflight_content_type(self, url: str, *, headers: Optional[dict] = None,
-                                      ssl_verify: bool = True, client_cert=None, timeout: float = 5.0,
+                                      ssl_verify=True, client_cert=None, timeout: float = 5.0,
                                       strict_redirect_headers: bool = False) -> None:
         """Probe *url* before the SDK connects: a plain web page would make the SDK sit out the full
         ``connect_timeout`` before an opaque ``CancelledError``; this raises NonMcpEndpointError within
@@ -618,7 +633,7 @@ class MCPServerTransportMixin:
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = _core.LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
-        common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
+        common = (url, headers, connect_timeout, _resolve_mcp_ssl_verify(config, url), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
         if config.get("transport") == "sse":
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
