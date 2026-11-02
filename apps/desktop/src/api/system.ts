@@ -161,13 +161,21 @@ export function updateHermes(): Promise<ActionResponse> {
   })
 }
 
+// The check fans out into bounded-but-serial git/GitHub probes on the backend
+// (source_check.check_for_updates) and shares the process with maintenance that
+// can briefly starve responses (profile deletes, gateway drains). A
+// busy-but-alive remote backend can pass the 30s fetch default while still
+// answering — the client must outlast the stall, not race it (#48504 class).
+export const UPDATE_CHECK_REQUEST_TIMEOUT_MS = 120_000
+
 /** Query the connected backend's own update state. In remote mode this is the
  *  authoritative source for the backend's behind-count + "what's changed",
  *  distinct from the Electron client clone's git state. */
 export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResponse> {
   return hermesApi<BackendUpdateCheckResponse>({
     ...profileScoped(),
-    path: `/api/hermes/update/check${force ? '?force=true' : ''}`
+    path: `/api/hermes/update/check${force ? '?force=true' : ''}`,
+    timeoutMs: UPDATE_CHECK_REQUEST_TIMEOUT_MS
   })
 }
 
