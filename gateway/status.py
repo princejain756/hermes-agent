@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -835,11 +836,24 @@ def _build_runtime_status_record() -> dict[str, Any]:
 def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[str, Any]]:
     """JSON object at ``path``, or None when absent/empty/unreadable/invalid. ``bare_pid_ok`` also
     accepts legacy bare-integer PID files as ``{"pid": N}``."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
     try:
-        raw = path.read_text(encoding="utf-8-sig").strip()
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            raw = handle.read().decode("utf-8-sig").strip()
     except (OSError, UnicodeDecodeError):
-        # OSError: file vanished or permission flipped between exists() and
-        # read. UnicodeDecodeError: file holds non-UTF-8 / binary garbage
+        # OSError: file vanished or permission flipped between open and read.
+        # UnicodeDecodeError: file holds non-UTF-8 / binary garbage
         # (a truncated or clobbered status file). Either way it's unusable.
         return None
     if not raw:

@@ -1435,6 +1435,39 @@ class TestCorruptStatusFiles:
         p.write_bytes(b"\xff\xfe\x00\x80not utf-8\x81")
         assert status._read_json_file(p) is None
 
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="mkfifo requires POSIX")
+    def test_get_running_pid_does_not_block_on_writerless_fifo_pid_file(self, tmp_path):
+        """A writerless FIFO at gateway.pid alongside a held gateway.lock must not block
+        _read_json_file / get_running_pid forever (#151383)."""
+        import subprocess
+        import sys
+
+        pid_path = tmp_path / "gateway.pid"
+        os.mkfifo(pid_path)  # windows-footgun: ok — POSIX-gated via skipif(not hasattr(os, "mkfifo"))
+        code = (
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "import gateway.status as status\n"
+            "home = Path(sys.argv[1])\n"
+            "os.environ['HERMES_HOME'] = str(home)\n"
+            "assert status.acquire_gateway_runtime_lock()\n"
+            "try:\n"
+            "    assert status._read_json_file(home / 'gateway.pid') is None\n"
+            "    assert status.get_running_pid(home / 'gateway.pid', cleanup_stale=False) is None\n"
+            "finally:\n"
+            "    status.release_gateway_runtime_lock()\n"
+        )
+        res = subprocess.run(
+            [sys.executable, "-c", code, str(tmp_path)],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=5,
+            check=False,
+        )
+        assert res.returncode == 0, res.stderr or res.stdout
+
 
 class TestParseActiveAgents:
     """The shared read-side coercion used by BOTH HTTP surfaces (/api/status
