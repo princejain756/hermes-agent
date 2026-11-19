@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import types
 from pathlib import Path
 
@@ -41,6 +42,12 @@ def _seed(*roots: Path) -> None:
         (root / "pkg").mkdir(parents=True)
 
 
+def _join_reapers(reload, hooks) -> None:
+    for fn, args in list(hooks):
+        if fn is reload._join_reaper:
+            fn(*args)
+
+
 def test_dead_owned_roots_are_reclaimed_and_everything_else_is_kept(loader):
     from pm.filesystem import lock_path
 
@@ -63,6 +70,7 @@ def test_dead_owned_roots_are_reclaimed_and_everything_else_is_kept(loader):
         assert mine.parent == parent and mine.name.startswith(owned)
         assert live.is_dir() and all(k.is_dir() for k in kept)
         assert not dead.exists()
+        _join_reapers(reload, _hooks)
         assert not [e for e in parent.iterdir() if e.name.startswith(reload._REAPING_PREFIX)]
         # The next process to start leaves this one's root alone.
         reload._snapshot_root = None
@@ -80,6 +88,8 @@ def test_a_sweeper_that_died_mid_delete_has_its_claims_finished(loader):
     reload._new_root()
 
     assert not leftover.exists()
+    _join_reapers(reload, _hooks)
+    assert not [e for e in _parent().iterdir() if e.name.startswith(reload._REAPING_PREFIX)]
 
 
 @pytest.mark.parametrize("failure", ["timeout", "foreign lock file"])
@@ -199,3 +209,68 @@ def test_a_data_only_uninstall_keeps_the_snapshots_live_processes_import(loader,
 
     assert not failures and not (home / "notes.md").exists()
     assert (root / "pkg" / "lazy.py").is_file()
+
+
+def test_dead_root_deletion_runs_on_background_thread_joined_on_exit(loader, monkeypatch):
+    reload, hooks = loader
+    parent = _parent()
+    dead = parent / f"{reload._OWNED_PREFIX}dead"
+    _seed(dead)
+    (dead / reload._OWNER_LOCK).write_text("")
+
+    real_rmtree = shutil.rmtree
+    started = threading.Event()
+    allow_finish = threading.Event()
+    caller = threading.current_thread()
+    cleanup_threads: list[threading.Thread] = []
+    timed_out = False
+
+    def gated_rmtree(path, *args, **kwargs):
+        nonlocal timed_out
+        if Path(path).name.startswith(reload._REAPING_PREFIX):
+            cleanup_threads.append(threading.current_thread())
+            started.set()
+            if not allow_finish.wait(timeout=2.0):
+                timed_out = True
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(reload.shutil, "rmtree", gated_rmtree)
+
+    try:
+        mine = reload._new_root()
+        assert mine.is_dir() and not dead.exists()
+        assert started.wait(timeout=2.0)
+        assert cleanup_threads == [cleanup_threads[0]]
+        assert cleanup_threads[0] is not caller
+        assert not timed_out
+    finally:
+        allow_finish.set()
+
+    for fn, args in reversed(hooks):
+        fn(*args)
+    hooks.clear()
+    assert not [e for e in parent.iterdir() if e.name.startswith(reload._REAPING_PREFIX)]
+    assert not mine.exists()
+
+
+def test_reaper_thread_start_failure_falls_back_to_inline_cleanup(loader, monkeypatch):
+    reload, hooks = loader
+    parent = _parent()
+    dead = parent / f"{reload._OWNED_PREFIX}dead"
+    _seed(dead)
+    (dead / reload._OWNER_LOCK).write_text("")
+
+    class FailingThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(reload.threading, "Thread", FailingThread)
+
+    mine = reload._new_root()
+
+    assert mine.is_dir() and not dead.exists()
+    assert not [e for e in parent.iterdir() if e.name.startswith(reload._REAPING_PREFIX)]
+    assert len(hooks) == 1

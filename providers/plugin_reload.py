@@ -92,6 +92,35 @@ def _claim_dead_roots(parent: Path) -> list[Path]:
     return claimed
 
 
+def _delete_claims(claims: list[Path]) -> None:
+    for claim in claims:
+        shutil.rmtree(claim, ignore_errors=True)
+
+
+def _join_reaper(thread: threading.Thread, creator_pid: int) -> None:
+    # A forked child inherits atexit hooks without the parent's background threads.
+    if os.getpid() != creator_pid:
+        return
+    thread.join()
+
+
+def _reap_claims(claims: list[Path]) -> None:
+    if not claims:
+        return
+    thread = threading.Thread(
+        target=_delete_claims,
+        args=(claims,),
+        name="provider-plugin-reaper",
+        daemon=False,
+    )
+    try:
+        thread.start()
+    except RuntimeError:
+        _delete_claims(claims)
+        return
+    atexit.register(_join_reaper, thread, os.getpid())
+
+
 def _release_root(root: Path, owner_fd: int | None, creator_pid: int) -> None:
     # A forked child inherits this hook and shares the flock (it belongs to the open file): its exit must
     # neither delete the parent's live copy nor drop the parent's lock.
@@ -135,8 +164,7 @@ def _new_root() -> Path:
             raise OSError(f"{root / _OWNER_LOCK} is held by another process")
     finally:
         os.close(setup_fd)
-        for claim in claimed:
-            shutil.rmtree(claim, ignore_errors=True)
+        _reap_claims(claimed)
     atexit.register(_release_root, root, owner_fd, os.getpid())
     return root
 
