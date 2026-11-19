@@ -53,6 +53,10 @@ _SETUP_WAIT_SECONDS = 30
 # One directory per process for the frozen copies; removed on a normal exit, reclaimed later otherwise.
 _snapshot_root: Path | None = None
 _snapshot_lock = threading.Lock()
+# Single-flight coordination per (id(layer), base_name) so concurrent first lookups on one profile
+# wait for the importing thread to publish instead of publishing an empty staging layer over it.
+_in_flight_imports: dict[tuple[int, str], threading.Event] = {}
+_active_imports = threading.local()
 
 
 def _owner_gone(root: Path) -> bool:
@@ -188,35 +192,71 @@ def import_into_layer(plugin_dir: Path, source: str, base_name: str) -> None:
     import providers as P
 
     layer = P._REGISTRATION_TARGET.get()
-    fingerprint = tree_fingerprint(plugin_dir)
-    live = layer.trees.get(base_name)
-    if live is not None and live[0] == fingerprint:
-        return
-    module_name = f"{base_name}_{fingerprint}"
-    staging = P._HomeLayer()
-    token = P._REGISTRATION_TARGET.set(staging)
+    flight_key = (id(layer), base_name)
+    active: set[tuple[int, str]] | None = getattr(_active_imports, "keys", None)
+    if active is None:
+        active = set()
+        _active_imports.keys = active
+
+    while True:
+        fingerprint = tree_fingerprint(plugin_dir)
+        with P._HOME_LAYERS_LOCK:
+            live = layer.trees.get(base_name)
+            if live is not None and live[0] == fingerprint:
+                return
+            if flight_key in active:
+                return  # same-thread re-entry during plugin import
+            in_flight = _in_flight_imports.get(flight_key)
+            if in_flight is None:
+                in_flight = threading.Event()
+                _in_flight_imports[flight_key] = in_flight
+                break
+        in_flight.wait()
+        with P._HOME_LAYERS_LOCK:
+            live = layer.trees.get(base_name)
+            if live is not None and live[0] == fingerprint:
+                return
+            if plugin_dir.name in layer.errors:
+                return
+
+    active.add(flight_key)
     try:
-        # In-process code (including a hosted plugin's in-process profiles) reads the frozen copy; the plugin
-        # host keeps the installed path, the stable key of its extraction cache.
-        P._import_user_module(plugin_dir, source, module_name, code_dir=_snapshot(plugin_dir, module_name))
-    except OSError as exc:  # the frozen copy could not be made: keep serving the previous version
-        logger.warning("Could not stage provider plugin %s: %s", plugin_dir.name, exc)
-        staging.errors[plugin_dir.name] = f"{type(exc).__name__}: {exc}"
+        module_name = f"{base_name}_{fingerprint}"
+        staging = P._HomeLayer()
+        executed = False
+        token = P._REGISTRATION_TARGET.set(staging)
+        try:
+            # In-process code (including a hosted plugin's in-process profiles) reads the frozen copy; the plugin
+            # host keeps the installed path, the stable key of its extraction cache.
+            executed = bool(
+                P._import_user_module(plugin_dir, source, module_name, code_dir=_snapshot(plugin_dir, module_name))
+            )
+        except OSError as exc:  # the frozen copy could not be made: keep serving the previous version
+            logger.warning("Could not stage provider plugin %s: %s", plugin_dir.name, exc)
+            staging.errors[plugin_dir.name] = f"{type(exc).__name__}: {exc}"
+        finally:
+            P._REGISTRATION_TARGET.reset(token)
+        if executed or module_name in staging.hosted:
+            _publish(layer, base_name, module_name, fingerprint, staging, replacing=live is not None)
+            with P._HOME_LAYERS_LOCK:
+                layer.errors.pop(plugin_dir.name, None)
+            if live is not None:
+                logger.info("Provider plugin %s changed on disk; new sessions use the updated version",
+                            plugin_dir.name)
+            return
+        # A failed import leaves the previous version serving; drop what it half-loaded so a retry is clean.
+        if module_name not in sys.modules:
+            prefix = module_name + "."
+            for name in [m for m in sys.modules if m.startswith(prefix)]:
+                del sys.modules[name]
+        if error := staging.errors.get(plugin_dir.name):
+            with P._HOME_LAYERS_LOCK:
+                layer.errors[plugin_dir.name] = error
     finally:
-        P._REGISTRATION_TARGET.reset(token)
-    if module_name in sys.modules or module_name in staging.hosted:
-        _publish(layer, base_name, module_name, fingerprint, staging, replacing=live is not None)
-        layer.errors.pop(plugin_dir.name, None)
-        if live is not None:
-            logger.info("Provider plugin %s changed on disk; new sessions use the updated version",
-                        plugin_dir.name)
-        return
-    # A failed import leaves the previous version serving; drop what it half-loaded so a retry is clean.
-    prefix = module_name + "."
-    for name in [m for m in sys.modules if m.startswith(prefix)]:
-        del sys.modules[name]
-    if error := staging.errors.get(plugin_dir.name):
-        layer.errors[plugin_dir.name] = error
+        active.discard(flight_key)
+        with P._HOME_LAYERS_LOCK:
+            _in_flight_imports.pop(flight_key, None)
+        in_flight.set()
 
 
 def _publish(layer, base_name: str, module_name: str, fingerprint: str, staging, *, replacing: bool) -> None:

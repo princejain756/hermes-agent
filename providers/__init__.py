@@ -64,6 +64,9 @@ _PROVIDER_LIST_CACHE: list[ProviderProfile] | None = None
 _REGISTRY_GENERATION = 0
 _discovered = False
 _discovering = False
+_DISCOVERING_DEPTH = 0
+_DISCOVERING_LOCK = threading.Lock()
+_THREAD_DISCOVERING: ContextVar[int] = ContextVar("_provider_thread_discovering", default=0)
 _PLUGIN_DIR_STAMP_TTL_SECONDS = 1.0
 # Widest directory mtime granularity in use (FAT rounds to 2 s, HFS+ to 1 s; a kernel without
 # fine-grained timestamps stamps every change within one ~4 ms clock tick alike).
@@ -103,6 +106,27 @@ class _HomeLayer:
 
 _HOME_LAYERS: dict[str, _HomeLayer] = {}
 _HOME_LAYERS_LOCK = threading.Lock()
+def _enter_discovering():
+    global _discovering, _DISCOVERING_DEPTH
+    token = _THREAD_DISCOVERING.set(_THREAD_DISCOVERING.get() + 1)
+    with _DISCOVERING_LOCK:
+        _DISCOVERING_DEPTH += 1
+        _discovering = True
+    return token
+
+
+def _exit_discovering(token) -> None:
+    global _discovering, _DISCOVERING_DEPTH
+    _THREAD_DISCOVERING.reset(token)
+    with _DISCOVERING_LOCK:
+        _DISCOVERING_DEPTH = max(0, _DISCOVERING_DEPTH - 1)
+        _discovering = _DISCOVERING_DEPTH > 0
+
+
+def _is_discovering_here() -> bool:
+    return _THREAD_DISCOVERING.get() > 0
+
+
 # The layer a ``$HERMES_HOME`` plugin import registers into. A ContextVar, not a module global:
 # two turn threads scanning two profile homes at once must not cross-register. Never a lock held
 # across the import itself — a thread mid-``import hermes_cli.auth`` (whose import calls
@@ -171,7 +195,7 @@ def register_provider(profile: ProviderProfile) -> None:
         for alias in profile.aliases:
             _ALIASES[alias] = profile.name
         _PROVIDER_LIST_CACHE = None
-    if _discovered and not _discovering:  # post-discovery registration: mirror it immediately
+    if _discovered and not _is_discovering_here():  # post-discovery registration: mirror it immediately
         _sync_auth_registry()
 
 
@@ -416,7 +440,7 @@ def bound_profile_resolver():
     periodic plugin-dir stamp check, skipped mid-scan so a plugin reading the mirror while it imports
     cannot re-enter its own scan.
     """
-    layer = _bound_home_layer()[0] if _discovering else _home_layer()
+    layer = _bound_home_layer()[0] if _is_discovering_here() else _home_layer()
 
     def resolve(name: str) -> tuple[ProviderProfile | None, ProviderProfile | None]:
         shared = _ALIASES.get(name, name)
@@ -490,7 +514,7 @@ def _refresh_home_layer(layer: _HomeLayer, home: Path | None, key: str, *, force
         # unpublished stamp rescanned forever; an unpublished check time
         # re-stats the plugin dirs inside the TTL.
         layer.stamp_checked_at = now
-        if _discovered and not _discovering:
+        if _discovered and not _is_discovering_here():
             _sync_auth_registry()
     layer.stamp_checked_at = now
     return True
@@ -593,9 +617,8 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
     ``kind: model-provider`` (PluginManager owns every other kind there). Per-home module names
     let two profiles carry the same plugin without aliasing each other's registrations.
     """
-    global _discovering
-    token, prior_discovering = _REGISTRATION_TARGET.set(layer), _discovering
-    _discovering = True
+    token = _REGISTRATION_TARGET.set(layer)
+    disc_token = _enter_discovering()
     try:
         user_dir = _user_plugins_dir()
         if user_dir is not None:
@@ -611,7 +634,7 @@ def _scan_home_layer(layer: _HomeLayer, key: str) -> None:
                     _import_plugin_dir(child, "user", home_key=key)
     finally:
         _REGISTRATION_TARGET.reset(token)
-        _discovering = prior_discovering
+        _exit_discovering(disc_token)
 
 
 def _plugin_disabled(plugin_dir: Path) -> bool:
@@ -664,17 +687,16 @@ def _import_user_plugin_dir(plugin_dir: Path, source: str, module_name: str) -> 
         _import_user_module(plugin_dir, source, module_name)
 
 
-def _import_user_module(plugin_dir: Path, source: str, module_name: str, code_dir: Path | None = None) -> None:
+def _import_user_module(plugin_dir: Path, source: str, module_name: str, code_dir: Path | None = None) -> bool:
     """*code_dir*: where in-process code is imported from (a frozen copy of *plugin_dir*), default the dir."""
     from hermes_cli.plugin_isolation import ISOLATION_HOST, isolation_mode
     if isolation_mode() == ISOLATION_HOST:  # the plugin's code runs in the plugin host
-        _import_hosted_plugin_dir(plugin_dir, source, module_name, code_dir=code_dir)
-    else:
-        _exec_plugin_module(code_dir or plugin_dir, source, module_name)
+        return _import_hosted_plugin_dir(plugin_dir, source, module_name, code_dir=code_dir)
+    return _exec_plugin_module(code_dir or plugin_dir, source, module_name)
 
 
 def _import_hosted_plugin_dir(plugin_dir: Path, source: str, module_name: str, *,
-                              code_dir: Path | None = None) -> None:
+                              code_dir: Path | None = None) -> bool:
     """Register a plugin's profiles as plugin-host proxies; a profile that cannot cross the host
     boundary (e.g. it overrides ``create_client``) is imported in-process ALONE, with a warning,
     so it never takes its hosted siblings down with it. The host is keyed by *plugin_dir*; that in-process
@@ -683,7 +705,7 @@ def _import_hosted_plugin_dir(plugin_dir: Path, source: str, module_name: str, *
     from hermes_cli.plugin_host_profiles import load_hosted_profiles
     layer = _REGISTRATION_TARGET.get()
     if layer is not None and module_name in layer.hosted:
-        return  # already imported into this home's layer
+        return False  # already imported into this home's layer
     _current_source = source
     try:
         hosted, in_process = load_hosted_profiles(plugin_dir, module_name)
@@ -692,7 +714,7 @@ def _import_hosted_plugin_dir(plugin_dir: Path, source: str, module_name: str, *
     except Exception as exc:  # health: allow BLE001 -- plugin load boundary (moved from _import_plugin_dir): one broken plugin never breaks discovery
         logger.warning("Failed to load user provider plugin %s in the plugin host: %s", plugin_dir.name, exc)
         _note_load_result(plugin_dir, exc)
-        return
+        return False
     finally:
         _current_source = None
     if in_process:
@@ -705,15 +727,16 @@ def _import_hosted_plugin_dir(plugin_dir: Path, source: str, module_name: str, *
         finally:
             _REGISTRATION_ONLY.reset(token)
         if module_name not in sys.modules:
-            return  # the in-process import failed: the next scan retries the plugin
+            return False  # the in-process import failed: the next scan retries the plugin
     if layer is not None:
         layer.hosted.add(module_name)
+    return True
 
 
-def _exec_plugin_module(plugin_dir: Path, source: str, module_name: str) -> None:
+def _exec_plugin_module(plugin_dir: Path, source: str, module_name: str) -> bool:
     global _current_source
     if module_name in sys.modules:
-        return  # already imported
+        return False  # already imported
 
     _current_source = source
     try:
@@ -721,17 +744,19 @@ def _exec_plugin_module(plugin_dir: Path, source: str, module_name: str) -> None
             module_name, plugin_dir / "__init__.py", submodule_search_locations=[str(plugin_dir)]
         )
         if spec is None or spec.loader is None:
-            return
+            return False
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
         _note_load_result(plugin_dir, None)
+        return True
     except Exception as exc:  # health: allow BLE001 -- plugin import boundary (moved from _import_plugin_dir): one broken plugin never breaks discovery
         logger.warning(
             "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc
         )
         sys.modules.pop(module_name, None)
         _note_load_result(plugin_dir, exc)
+        return False
     finally:
         _current_source = None
 
@@ -927,15 +952,15 @@ def _discover_providers() -> None:
 
     if safe_worker_enabled():
         return
-    global _discovered, _discovering
+    global _discovered
     if _discovered:
         return
     _discovered = True
-    _discovering = True
+    disc_token = _enter_discovering()
     try:
         _run_discovery_steps()
     finally:
-        _discovering = False
+        _exit_discovering(disc_token)
         # hermes_cli.auth may have been imported by a plugin during discovery and snapshotted a
         # partial profile list — hand it the complete one (no-op unless auth is already loaded).
         _sync_auth_registry()
