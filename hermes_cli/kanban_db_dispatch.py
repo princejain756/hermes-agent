@@ -2123,7 +2123,7 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task  # reassigned since the gates: CAS loses (#147534)
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee)
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, expect_assignee=assignee, validate_skills=True)
     if claimed is None:
         return False
     try:

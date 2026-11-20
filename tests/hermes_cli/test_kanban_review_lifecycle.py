@@ -647,6 +647,10 @@ def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     )
     captured: list[list[str]] = []
 
+    rev_skill = kanban_home / "skills" / "domain-specific-review"
+    rev_skill.mkdir(parents=True, exist_ok=True)
+    (rev_skill / "SKILL.md").write_text("---\nname: domain-specific-review\ndescription: review\n---\n")
+
     def spawn(task, workspace):
         captured.append(list(task.skills or []))
 

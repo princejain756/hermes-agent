@@ -332,6 +332,91 @@ def skills_list(category: str | None = None, task_id: str | None = None) -> str:
         return tool_error(str(e), success=False)
 
 
+def find_closest_skill_match(name: str) -> Optional[str]:
+    """Find the closest qualified or bare match for an unresolvable skill name.
+
+    If the name matches a plugin skill bare name or suffix, returns its qualified
+    name (e.g. 'shared-skills:foo' for 'foo'). Otherwise searches all available local
+    and plugin skill names.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+        discover_plugins()
+        pm = get_plugin_manager()
+        plugin_skills = getattr(pm, "_plugin_skills", {})
+    except Exception:
+        plugin_skills = {}
+
+    qualified_matches = [
+        qn for qn, entry in plugin_skills.items()
+        if entry.get("bare_name") == name or qn.endswith(f":{name}") or qn.endswith(f"/{name}")
+    ]
+    if qualified_matches:
+        return qualified_matches[0] if len(qualified_matches) == 1 else ", ".join(sorted(qualified_matches))
+
+    try:
+        all_local = [s["name"] for s in find_all_skills()]
+    except Exception:
+        all_local = []
+    all_plugin = list(plugin_skills.keys())
+    all_candidates = all_local + all_plugin
+
+    import difflib
+    if ":" in name:
+        close = difflib.get_close_matches(name, all_candidates, n=1, cutoff=0.5)
+        if close:
+            return close[0]
+
+    close = difflib.get_close_matches(name, all_candidates, n=1, cutoff=0.5)
+    if close:
+        return close[0]
+
+    bare_to_qn = {entry.get("bare_name"): qn for qn, entry in plugin_skills.items() if entry.get("bare_name")}
+    close_bare = difflib.get_close_matches(name, list(bare_to_qn.keys()), n=1, cutoff=0.5)
+    if close_bare:
+        return bare_to_qn[close_bare[0]]
+
+    return None
+
+
+def validate_skill_name(name: str) -> None:
+    """Validate that *name* resolves to an installed, enabled skill.
+
+    Raises ValueError naming the skill and the closest qualified match if it does not resolve.
+    """
+    raw_name = (name or "").strip()
+    if not raw_name:
+        raise ValueError("skill name cannot be empty")
+    from agent.skill_utils import normalize_skill_lookup_name
+    normalized = normalize_skill_lookup_name(raw_name)
+    try:
+        raw = skill_view(normalized, preprocess=False)
+        payload = json.loads(raw)
+        if payload.get("success"):
+            return
+        if "disabled" in (payload.get("error") or "").lower():
+            raise ValueError(payload["error"])
+    except ValueError:
+        raise
+    except Exception:
+        pass
+    closest = find_closest_skill_match(raw_name)
+    suggestion = f" (did you mean {closest!r}?)" if closest else ""
+    raise ValueError(f"skill {raw_name!r} does not resolve{suggestion}")
+
+
+def validate_task_skills(skills: Optional[Iterable[str]]) -> None:
+    """Validate that each skill in *skills* resolves to an installed skill.
+
+    Raises ValueError on the first unresolvable skill name.
+    """
+    if not skills:
+        return
+    for s in skills:
+        if s and str(s).strip():
+            validate_skill_name(str(s).strip())
+
+
 def _legacy_portable_skill_name(pm, namespace, bare):
     """Portable plugin skills were named ``agent-plugin-<slug>-<sha8>:<skill>`` before they took the
     plugin's own name; prompts and cron jobs saved since then may still carry that form. Resolved

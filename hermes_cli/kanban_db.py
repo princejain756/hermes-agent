@@ -1168,6 +1168,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    validate_skills: bool = True,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1221,6 +1222,9 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    if validate_skills and skills_list:
+        from tools.skills_tool import validate_task_skills
+        validate_task_skills(skills_list)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -2171,6 +2175,7 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    validate_skills: bool = False,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2181,6 +2186,19 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if validate_skills:
+            task_pre = get_task(conn, task_id)
+            if task_pre and task_pre.skills:
+                from tools.skills_tool import validate_task_skills
+                try:
+                    validate_task_skills(task_pre.skills)
+                except ValueError as exc:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked' "
+                        "WHERE id = ? AND status = 'ready'", (task_id,),
+                    )
+                    _append_event(conn, task_id, "claim_rejected", {"reason": "unresolvable_skills", "error": str(exc)})
+                    return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2206,6 +2224,7 @@ def claim_task(
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, expect_assignee: Optional[str] = None,
+    validate_skills: bool = False,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2214,6 +2233,19 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if validate_skills:
+            task_pre = get_task(conn, task_id)
+            if task_pre and task_pre.skills:
+                from tools.skills_tool import validate_task_skills
+                try:
+                    validate_task_skills(task_pre.skills)
+                except ValueError as exc:
+                    conn.execute(
+                        "UPDATE tasks SET status = 'blocked' "
+                        "WHERE id = ? AND status = 'review' AND claim_lock IS NULL", (task_id,),
+                    )
+                    _append_event(conn, task_id, "claim_rejected", {"reason": "unresolvable_skills", "error": str(exc)})
+                    return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
