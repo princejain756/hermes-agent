@@ -63,6 +63,24 @@ def test_cron_tick_homes_include_active_named_host(tmp_path, monkeypatch):
     assert cron_by_name["host"] == default_home / "profiles" / "host"
 
 
+def test_cron_tick_homes_custom_profile_resolves_process_home(tmp_path, monkeypatch):
+    """When the active profile is custom (sits outside profiles/), _cron_tick_profile_homes
+    resolves the process's own HERMES_HOME rather than profiles/custom."""
+    custom_home = tmp_path / "custom_deployment"
+    custom_home.mkdir(parents=True)
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "custom")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: custom_home)
+
+    import gateway.run as gateway_run
+
+    cfg = GatewayConfig(multiplex_profiles=True)
+    cron_homes = gateway_run._cron_tick_profile_homes(cfg)
+    cron_by_name = dict(cron_homes)
+
+    assert "custom" in cron_by_name
+    assert cron_by_name["custom"] == custom_home
+
+
 class TestNamedProfileMultiplexerGuard:
     """_guard_named_profile_under_multiplexer is inert unless all conditions hold."""
 

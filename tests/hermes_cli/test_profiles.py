@@ -1677,6 +1677,14 @@ class TestProfilesToServe:
         assert serve[0][0] == "coder"
         assert serve[0][1] == get_profile_dir("coder")
 
+    def test_off_returns_custom_hermes_home(self, profile_env, monkeypatch):
+        custom_dir = profile_env / "custom_home"
+        custom_dir.mkdir()
+        monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "custom")
+        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: custom_dir)
+        serve = profiles_to_serve(multiplex=False)
+        assert serve == [("custom", custom_dir)]
+
     def test_on_returns_default_plus_all_named(self, profile_env):
         create_profile("coder", no_alias=True)
         create_profile("writer", no_alias=True)

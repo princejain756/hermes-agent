@@ -1108,6 +1108,9 @@ def profiles_to_serve(multiplex: bool, *, include_standalone: bool = False,
         logger.warning("Ignoring gateway.parked for the default profile; stop the host gateway instead")
         _parked_default_warned.add(default)
     if not multiplex:
+        if active == "custom":
+            from hermes_constants import get_hermes_home
+            return [(active, get_hermes_home())]
         return [(active, get_profile_dir(active))]
     serve: list[tuple[str, Path]] = [("default", default)]
     serve.extend((entry.name, entry) for entry in _iter_named_profile_dirs()

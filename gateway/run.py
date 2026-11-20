@@ -1650,6 +1650,9 @@ def _cron_tick_profile_homes(config: object) -> list[tuple[str, Path]]:
     active = get_active_profile_name() or "default"  # launch profile, pre-identity (ticker boot)
     if any(name == active for name, _home in homes):
         return homes
+    if active == "custom":
+        from hermes_constants import get_hermes_home
+        return homes + [(active, get_hermes_home())]
     try:
         return homes + [(active, get_profile_dir(active))]
     except Exception:
