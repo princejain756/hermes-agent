@@ -214,6 +214,20 @@ class TestPinnedLocksTheMainModel:
         still = jobs.update_job(job["id"], {"pinned": True, "model": "other-model"})
         assert still["model"] == "other-model"
 
+    def test_pinned_local_runtime_captures_llamacpp(self, monkeypatch, tmp_path):
+        jobs, _ = self._store(monkeypatch, tmp_path)
+        resolver = MagicMock(return_value={
+            "provider": "custom",
+            "source": "local-runtime",
+            "requested_provider": "llamacpp",
+        })
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolver)
+
+        unpinned = jobs.create_job(prompt="local task", schedule="every 1 hour")
+        locked = jobs.update_job(unpinned["id"], {"pinned": True})
+        assert locked["provider"] == "llamacpp"
+        assert locked["model"] == "main-model"
+
 
 class TestRuntimeResolutionTargetModel:
     """run_job must resolve the primary provider against the model the job will actually run
@@ -228,3 +242,14 @@ class TestRuntimeResolutionTargetModel:
         assert success is True, error
         assert resolve_kwargs["target_model"] == "my-pinned-model"
         assert resolve_kwargs["requested"] == "openrouter"
+
+    def test_legacy_custom_heals_to_llamacpp(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("hermes_cli.runtime_provider.canonical_custom_identity",
+                            lambda base_url=None, model=None: "llamacpp" if base_url == "http://127.0.0.1:18434/v1" else None)
+        job = _base_job(model="local-model", provider="custom", base_url="http://127.0.0.1:18434/v1")
+        success, error, _agent_kwargs, resolve_kwargs = _run(
+            job, tmp_path, current_provider="openrouter", current_model="other-model")
+
+        assert success is True, error
+        assert resolve_kwargs["requested"] == "llamacpp"
+        assert "explicit_base_url" not in resolve_kwargs

@@ -32,5 +32,11 @@ def _main_model_pin() -> tuple[Optional[str], Optional[str]]:
     provider = None
     with contextlib.suppress(Exception):
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        provider = _normalize_job_optional_text(resolve_runtime_provider(requested=None).get("provider"))
+        runtime = resolve_runtime_provider(requested=None)
+        if runtime.get("source") == "local-runtime":
+            provider = "llamacpp"
+        elif (p := runtime.get("requested_provider")) and p != "custom":
+            provider = _normalize_job_optional_text(p)
+        else:
+            provider = _normalize_job_optional_text(runtime.get("provider"))
     return (provider.lower() if provider else None), model

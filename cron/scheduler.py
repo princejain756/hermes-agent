@@ -1712,6 +1712,16 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
 
     model = jc.model
     requested = job.get("provider") or jc.cron_default_provider or None
+    explicit_base_url = job.get("base_url") or None
+    if str(requested or "").strip().lower() == "custom":
+        try:
+            from hermes_cli.runtime_provider import canonical_custom_identity
+            if recovered := canonical_custom_identity(base_url=explicit_base_url, model=model or None):
+                requested = recovered
+                if recovered == "llamacpp":
+                    explicit_base_url = None
+        except Exception:
+            pass
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.
@@ -1720,8 +1730,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             # api_mode must derive from the model actually run, not the stale persisted default.
             "target_model": model,
         }
-        if job.get("base_url"):
-            runtime_kwargs["explicit_base_url"] = job.get("base_url")
+        if explicit_base_url:
+            runtime_kwargs["explicit_base_url"] = explicit_base_url
         return resolve_runtime_provider(**runtime_kwargs), model
     except Exception as resolve_exc:
         # Walk the fallback chain on AuthError AND transient network/DNS failures (e.g. during
