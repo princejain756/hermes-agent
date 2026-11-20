@@ -81,6 +81,32 @@ def test_cron_tick_homes_custom_profile_resolves_process_home(tmp_path, monkeypa
     assert cron_by_name["custom"] == custom_home
 
 
+def test_cron_tick_homes_custom_profile_with_named_custom_present(tmp_path, monkeypatch):
+    """When a named profile literally called 'custom' exists under profiles/ but the active
+    home is an external transient home, _cron_tick_profile_homes retains both paths."""
+    transient_home = tmp_path / "transient_home"
+    transient_home.mkdir(parents=True)
+    named_custom = tmp_path / "profiles" / "custom"
+    named_custom.mkdir(parents=True)
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "custom")
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: transient_home)
+
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_multiplex_profile_homes", lambda _cfg: [
+        ("default", tmp_path / "default"),
+        ("custom", named_custom),
+    ])
+
+    cfg = GatewayConfig(multiplex_profiles=True)
+    cron_homes = gateway_run._cron_tick_profile_homes(cfg)
+
+    paths = [home for _name, home in cron_homes]
+    assert named_custom in paths
+    assert transient_home in paths
+
+
 class TestNamedProfileMultiplexerGuard:
     """_guard_named_profile_under_multiplexer is inert unless all conditions hold."""
 
