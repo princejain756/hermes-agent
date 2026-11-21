@@ -19,6 +19,23 @@ def _accepts_keyword(callable_obj: Any, name: str) -> bool:
     )
 
 
+def _accepts_positional(callable_obj: Any) -> bool:
+    """Return whether a callable accepts at least one positional argument."""
+    try:
+        parameters = inspect.signature(callable_obj).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+        for p in parameters
+    )
+
+
 def request_hard_interrupt(
     agent: Any,
     message: str | None = None,
@@ -48,7 +65,7 @@ def request_hard_interrupt(
     kwargs = {}
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
-    if message is None:
+    if message is None or not _accepts_positional(interrupt):
         interrupt(**kwargs)
     else:
         interrupt(message, **kwargs)

@@ -32,6 +32,22 @@ class _LegacyAgent:
         self.calls.append(("legacy", message))
 
 
+class _ZeroArgInterruptAgent:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def interrupt(self) -> None:
+        self.calls += 1
+
+
+class _KeywordOnlyReasonAgent:
+    def __init__(self) -> None:
+        self.calls: list[str | None] = []
+
+    def interrupt(self, *, tool_reason: str | None = None) -> None:
+        self.calls.append(tool_reason)
+
+
 def test_explicit_producer_prefers_feature_detected_hard_interrupt() -> None:
     agent = _ModernAgent()
 
@@ -123,3 +139,19 @@ def test_tui_subagent_interrupt_is_an_explicit_hard_stop() -> None:
     assert len(agent.calls) == 1
     assert agent.calls[0][0] == "hard"
     assert subagent_id in agent.calls[0][1]
+
+
+def test_zero_arg_interrupt_callable_receives_no_message() -> None:
+    agent = _ZeroArgInterruptAgent()
+
+    assert request_hard_interrupt(agent, "stop now", tool_reason="gateway shutdown") is True
+
+    assert agent.calls == 1
+
+
+def test_keyword_only_tool_reason_interrupt_receives_keyword_without_message() -> None:
+    agent = _KeywordOnlyReasonAgent()
+
+    assert request_hard_interrupt(agent, "stop now", tool_reason="gateway shutdown") is True
+
+    assert agent.calls == ["gateway shutdown"]

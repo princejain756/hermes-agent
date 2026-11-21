@@ -1,5 +1,6 @@
 """A Stop after the turn adopted its agent reaches that agent even if the cache no longer holds it."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -70,3 +71,57 @@ async def test_retire_stop_between_adoption_and_promotion_reaches_the_adopted_ag
         stopped.set()
         await asyncio.wait_for(authority.sessions['s'].task, 5)
         assert ran['adopted'] is True, 'the profile Stop reached nobody: the adopted agent ran on'
+
+
+def test_stop_authority_turns_handles_adopted_managed_worker_open_and_closing():
+    """During managed shutdown, execute_managed.finally pops _managed_workers before worker.close()
+    sets worker.closed while authority.adopted still holds that worker. Re-polling stop_authority_turns
+    must signal an open worker without TypeError and treat an already-closing worker as a no-op."""
+    from gateway.run_runtime import stop_authority_turns
+    from gateway.session_managed_worker import ManagedWorker
+
+    worker = ManagedWorker(SimpleNamespace())
+    live = SimpleNamespace(route='r', event_stream=SimpleNamespace(execution={'execution_generation': 1}))
+    authority = SimpleNamespace(
+        runner=SimpleNamespace(_running_agents={}),
+        sessions={'s': live},
+        adopted={'s': (1, worker)},
+        pending_stops={},
+        _managed_workers={},
+        _managed_spawning={},
+    )
+
+    assert stop_authority_turns(authority, in_process=True) == 1
+    assert worker.stop.is_set() is True
+    assert worker.commands.get_nowait() == {'type': 'stop'}
+
+    closing_worker = ManagedWorker(SimpleNamespace())
+    closing_worker.closed.set()
+    authority.adopted['s'] = (1, closing_worker)
+
+    assert stop_authority_turns(authority, in_process=True) == 1
+
+
+def test_stop_authority_turns_isolates_failing_agent_interrupt():
+    """A raising interrupt on one session must not abort interrupting remaining active sessions."""
+    from gateway.run_runtime import stop_authority_turns
+
+    class _FailingAgent:
+        def hard_interrupt(self, message=None, **_kwargs):
+            raise RuntimeError('boom')
+
+    healthy = Agent()
+    authority = SimpleNamespace(
+        runner=SimpleNamespace(_running_agents={}),
+        sessions={
+            's1': SimpleNamespace(route='r1', event_stream=SimpleNamespace(execution={'execution_generation': 1})),
+            's2': SimpleNamespace(route='r2', event_stream=SimpleNamespace(execution={'execution_generation': 1})),
+        },
+        adopted={'s1': (1, _FailingAgent()), 's2': (1, healthy)},
+        pending_stops={},
+        _managed_workers={},
+        _managed_spawning={},
+    )
+
+    stop_authority_turns(authority, in_process=True)
+    assert healthy.interrupted is True

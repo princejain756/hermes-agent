@@ -297,7 +297,9 @@ class ManagedWorker:
             stopper.cancel()
             arrived.cancel()
 
-    def interrupt(self):
+    def interrupt(self, message=None, **_kwargs):
+        if self.closed.is_set() or self.stop.is_set():
+            return
         self.control({'type': 'stop'})
 
     def respond(self, kind, prompt_id, value):
