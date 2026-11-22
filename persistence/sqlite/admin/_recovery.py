@@ -404,8 +404,12 @@ def _salvage_rowid_bounds(source: sqlite3.Connection, table: str) -> dict[str, A
                 rows[edge] = int(row[0])
         except sqlite3.DatabaseError as exc:
             result["errors"].append(f"{edge} rowid: {exc}")
-    if rows["low"] is None and rows["high"] is None:
-        result["empty" if not result["errors"] else "unavailable"] = True
+    if rows["low"] is not None and rows["high"] is not None and rows["low"] > rows["high"]:
+        result["errors"].append(f"out-of-order edge rowids: low={rows['low']} > high={rows['high']}")
+        rows["low"] = None
+        rows["high"] = None
+    if rows["low"] is None and rows["high"] is None and not result["errors"]:
+        result["empty"] = True
         return result
 
     # An ordered LIMIT 1 walks the table b-tree and dies on a damaged edge leaf, while the
@@ -494,6 +498,8 @@ class _RowidRangeSalvage:
         self.select_sql = f'SELECT rowid, {quoted} FROM "{table}" WHERE rowid BETWEEN ? AND ? ORDER BY rowid'
         self.insert_sql = f'{insert_prefix} INTO "{table}" ({quoted}) VALUES ({placeholders})'
         self.exact_sql = f'SELECT {quoted} FROM "{table}" WHERE rowid = ?'
+        self.high_in_range_sql = f'SELECT rowid FROM "{table}" WHERE rowid BETWEEN ? AND ? ORDER BY rowid DESC LIMIT 1'
+        self.first_ge_sql = f'SELECT rowid FROM "{table}" WHERE rowid >= ? ORDER BY rowid ASC LIMIT 1'
         self.stopped_at_query_limit = False
 
     def _keep(self, values: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
@@ -534,8 +540,98 @@ class _RowidRangeSalvage:
         result["exact_lookup_recovered"] += 1
         return True
 
-    def copy_range(self, low: int, high: int) -> None:
-        """Copy ``[low, high]``; on a read error bisect the unread remainder, exact-lookup singletons."""
+    def _validate_chunk_order(
+        self, fetched: list[Any], low: int, high: int, last_committed_rowid: Optional[int],
+    ) -> None:
+        """Raise ``DatabaseError`` when a corrupted b-tree leaf emits rowids out of order or out of bounds."""
+        prev = last_committed_rowid
+        for row in fetched:
+            rid = int(row[0])
+            if rid < low or rid > high or (prev is not None and rid <= prev):
+                raise sqlite3.DatabaseError(f"out-of-order rowid {rid} in range [{low}, {high}]")
+            prev = rid
+
+    def _bisect_range(
+        self, retry_low: int, high: int, *, error: str, known_existing_upper: Optional[int],
+        left_upper: Optional[int] = None,
+    ) -> None:
+        if retry_low > high:
+            return
+        if retry_low == high:
+            if not self.recover_exact_rowid(retry_low):
+                self._skip(retry_low, high, error)
+            return
+        midpoint = retry_low + (high - retry_low) // 2
+        self.copy_range(
+            retry_low, midpoint,
+            known_existing_upper=known_existing_upper if left_upper is None else left_upper,
+        )
+        self.copy_range(midpoint + 1, high, known_existing_upper=known_existing_upper)
+
+    def _check_out_of_order_gap(self, retry_low: int, high: int, known_existing_upper: Optional[int]) -> None:
+        """Distinguish an empty tail/gap from an ascending scan stalled by an out-of-order leaf cell."""
+        if known_existing_upper is None or retry_low > known_existing_upper:
+            return
+        if self.result["range_queries"] >= _MAX_SALVAGE_RANGE_QUERIES:
+            self.stopped_at_query_limit = True
+            self._skip(retry_low, high, "salvage range query limit reached")
+            return
+        self.result["range_queries"] += 1
+        try:
+            ge_row = self.source.execute(self.first_ge_sql, (retry_low,)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._bisect_range(retry_low, high, error=str(exc), known_existing_upper=known_existing_upper)
+            return
+        if ge_row is None:
+            self._skip(retry_low, high, "out-of-order rowid stopped ascending scan")
+            return
+        first_ge = int(ge_row[0])
+        if first_ge < retry_low or first_ge > known_existing_upper:
+            self._skip(retry_low, high, f"out-of-order rowid {first_ge} stopped ascending scan")
+
+    def _probe_short_scan_tail(self, retry_low: int, high: int, known_existing_upper: Optional[int]) -> None:
+        """Probe the unread tail ``[retry_low, high]`` in reverse when an ascending scan finishes cleanly.
+
+        An out-of-order rowid exceeding ``high`` (such as an FTS data page sitting inside ``messages``)
+        terminates ``rowid BETWEEN low AND high ORDER BY rowid`` early without raising ``DatabaseError``.
+        """
+        if self.result["range_queries"] >= _MAX_SALVAGE_RANGE_QUERIES:
+            self.stopped_at_query_limit = True
+            self._skip(retry_low, high, "salvage range query limit reached")
+            return
+        self.result["range_queries"] += 1
+        try:
+            row = self.source.execute(self.high_in_range_sql, (retry_low, high)).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._bisect_range(retry_low, high, error=str(exc), known_existing_upper=known_existing_upper)
+            return
+        if row is None:
+            self._check_out_of_order_gap(retry_low, high, known_existing_upper)
+            return
+        probe_high = int(row[0])
+        if probe_high < retry_low or probe_high > high:
+            self._bisect_range(
+                retry_low, high,
+                error=f"out-of-order rowid {probe_high} encountered during reverse probe",
+                known_existing_upper=known_existing_upper,
+            )
+            return
+        if retry_low == high:
+            result = self.result
+            before = result["copied_rows"] + result["excluded_rows"] + result["destination_rejected_rows"]
+            if not self.recover_exact_rowid(retry_low) or (
+                result["copied_rows"] + result["excluded_rows"] + result["destination_rejected_rows"] == before
+            ):
+                self._skip(retry_low, high, "out-of-order rowid stopped ascending scan")
+            return
+        left_upper = probe_high if known_existing_upper is None else min(known_existing_upper, probe_high)
+        self._bisect_range(
+            retry_low, high, error="out-of-order rowid stopped ascending scan",
+            known_existing_upper=known_existing_upper, left_upper=left_upper,
+        )
+
+    def copy_range(self, low: int, high: int, *, known_existing_upper: Optional[int] = None) -> None:
+        """Copy ``[low, high]``; on a read error or stalled scan bisect the unread remainder."""
         result = self.result
         if low > high:
             return
@@ -550,7 +646,8 @@ class _RowidRangeSalvage:
             while True:
                 fetched = cursor.fetchmany(self.chunk_size)
                 if not fetched:
-                    return
+                    break
+                self._validate_chunk_order(fetched, low, high, last_committed_rowid)
                 values = [tuple(row[1:]) for row in fetched]
                 included = self._keep(values)
                 if included:
@@ -566,15 +663,11 @@ class _RowidRangeSalvage:
                     })
         except sqlite3.DatabaseError as exc:
             retry_low = last_committed_rowid + 1 if last_committed_rowid is not None else low
-            if retry_low > high:
-                return
-            if retry_low == high:
-                if not self.recover_exact_rowid(retry_low):
-                    self._skip(retry_low, high, str(exc))
-                return
-            midpoint = retry_low + (high - retry_low) // 2
-            self.copy_range(retry_low, midpoint)
-            self.copy_range(midpoint + 1, high)
+            self._bisect_range(retry_low, high, error=str(exc), known_existing_upper=known_existing_upper)
+            return
+        retry_low = last_committed_rowid + 1 if last_committed_rowid is not None else low
+        if retry_low <= high:
+            self._probe_short_scan_tail(retry_low, high, known_existing_upper)
 
 
 def _copy_table_salvage(
@@ -605,7 +698,8 @@ def _copy_table_salvage(
         source, destination, table, columns, chunk_size=chunk_size, progress_cb=progress_cb, source_rows=source_rows,
         insert_prefix=insert_prefix, row_filter=row_filter, result=result,
     )
-    salvage.copy_range(int(bounds["low"]), int(bounds["high"]))
+    known_existing_upper = None if "high" in bounds.get("fallback_edges", ()) else int(bounds["high"])
+    salvage.copy_range(int(bounds["low"]), int(bounds["high"]), known_existing_upper=known_existing_upper)
     skipped_ranges = result["skipped_rowid_ranges"]
     result["skipped_rowid_span"] = sum(item["high"] - item["low"] + 1 for item in skipped_ranges)
     result["query_limit_reached"] = salvage.stopped_at_query_limit

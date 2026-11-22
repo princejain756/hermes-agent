@@ -334,6 +334,39 @@ def _corrupt_table_root(path: Path, root_page: int) -> None:
     path.write_bytes(data)
 
 
+def _overwrite_table_leaf_with_fts_data_page(
+    path: Path,
+    table_root: int,
+    *,
+    leaf_index: int,
+) -> int:
+    """Copy an FTS data b-tree leaf into one ``messages`` leaf so its cells hold out-of-order rowids."""
+    conn = sqlite3.connect(str(path))
+    try:
+        fts_row = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name LIKE 'messages_fts%data' ORDER BY name"
+        ).fetchone()
+        assert fts_row is not None
+        fts_root = int(fts_row[0])
+    finally:
+        conn.close()
+
+    page_size, table_leaves = _btree_leaf_pages(path, table_root)
+    fts_page_size, fts_leaves = _btree_leaf_pages(path, fts_root)
+    assert fts_page_size == page_size
+    assert len(table_leaves) >= 5
+    assert fts_leaves
+    target_leaf = table_leaves[leaf_index]
+    donor_leaf = fts_leaves[len(fts_leaves) // 2]
+    data = bytearray(path.read_bytes())
+    target_start = (target_leaf - 1) * page_size
+    donor_start = (donor_leaf - 1) * page_size
+    assert data[target_start] == 0x0D and data[donor_start] == 0x0D
+    data[target_start : target_start + page_size] = data[donor_start : donor_start + page_size]
+    path.write_bytes(data)
+    return target_leaf
+
+
 def test_snapshot_blocks_connections_opened_during_the_copy(
     tmp_path: Path,
 ) -> None:
@@ -1000,3 +1033,86 @@ def test_recover_carries_message_identity_columns(tmp_path):
         assert [m["message_uid"] for m in restored] == [r["message_uid"] for r in expected]
         assert restored[0]["_absorbed_message_uids"] == ["b" * 32]
         assert restored[2]["_tool_call_uid"] == restored[1]["_tool_call_uids"]["call_1"]
+
+
+def test_partial_recovery_salvages_past_out_of_order_rowid_leaf(tmp_path: Path) -> None:
+    """#158969: an FTS data page sitting in the ``messages`` b-tree causes an ascending rowid range
+    scan to end early with no DatabaseError; salvage must continue past the damaged leaf and report it."""
+    source = tmp_path / "out-of-order-mid" / "state.db"
+    output = tmp_path / "out-of-order-mid-recovered.db"
+    message_count = 320
+    messages_root, _ = _make_page_spanning_source(source, message_count)
+    _, table_leaves = _btree_leaf_pages(source, messages_root)
+    _overwrite_table_leaf_with_fts_data_page(source, messages_root, leaf_index=len(table_leaves) // 2)
+
+    with sqlite3.connect(str(source)) as conn:
+        integrity = [row[0] for row in conn.execute("PRAGMA integrity_check").fetchall()]
+        assert any("out of order" in line for line in integrity)
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == message_count
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=64, allow_partial=True)
+
+    assert report["verified"] is True
+    assert report["partial"] is True
+    assert report["complete"] is False
+    assert report["verification"]["integrity_check"] == ["ok"]
+    assert report["verification"]["foreign_key_check"] == []
+    copied = report["copy"]["messages"]
+    assert copied["status"] == "partial"
+    assert copied["query_limit_reached"] is False
+    assert copied["skipped_rowid_ranges"]
+    assert any("out-of-order rowid" in item["error"] for item in copied["skipped_rowid_ranges"])
+    assert copied["copied_rows"] > message_count * 0.9
+    assert copied["copied_rows"] + copied["skipped_rowid_span"] == message_count
+
+
+def test_partial_recovery_salvages_when_first_leaf_has_out_of_order_rowid(tmp_path: Path) -> None:
+    """When the leftmost ``messages`` leaf holds out-of-order FTS rowids, salvage must still recover
+    all remaining leaves and record the skipped first-leaf span starting at rowid 1."""
+    source = tmp_path / "out-of-order-first" / "state.db"
+    output = tmp_path / "out-of-order-first-recovered.db"
+    message_count = 320
+    messages_root, _ = _make_page_spanning_source(source, message_count)
+    _overwrite_table_leaf_with_fts_data_page(source, messages_root, leaf_index=0)
+
+    report = recover_session_database(source, output, work_dir=tmp_path, chunk_size=64, allow_partial=True)
+
+    assert report["verified"] is True
+    assert report["partial"] is True
+    copied = report["copy"]["messages"]
+    assert copied["status"] == "partial"
+    assert copied["query_limit_reached"] is False
+    assert copied["skipped_rowid_ranges"]
+    assert copied["skipped_rowid_ranges"][0]["low"] == 1
+    assert copied["copied_rows"] > message_count * 0.9
+    assert copied["copied_rows"] + copied["skipped_rowid_span"] == message_count
+
+
+def test_partial_recovery_sparse_deleted_gaps_report_no_false_skips(tmp_path: Path) -> None:
+    """Healthy deleted rowid gaps must finish in one range scan without flagging any skipped rows."""
+    source = tmp_path / "sparse-gaps" / "state.db"
+    message_count = 400
+    _make_page_spanning_source(source, message_count)
+    with sqlite3.connect(str(source)) as conn:
+        conn.execute("DELETE FROM messages WHERE id BETWEEN 100 AND 250")
+        conn.commit()
+        expected_rows = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+    assert expected_rows == 249
+
+    source_conn = sqlite3.connect(str(source))
+    dest_conn = sqlite3.connect(":memory:")
+    try:
+        cols = [row[1] for row in source_conn.execute('PRAGMA table_info("messages")').fetchall()]
+        col_defs = ", ".join(f'"{c}"' for c in cols)
+        dest_conn.execute(f"CREATE TABLE messages ({col_defs})")
+        result = _recovery._copy_table_salvage(
+            source_conn, dest_conn, "messages", chunk_size=64, progress_cb=None, source_rows=expected_rows,
+        )
+    finally:
+        source_conn.close()
+        dest_conn.close()
+
+    assert result["status"] == "complete"
+    assert result["skipped_rowid_ranges"] == []
+    assert result["copied_rows"] == expected_rows
+    assert result["range_queries"] == 1
