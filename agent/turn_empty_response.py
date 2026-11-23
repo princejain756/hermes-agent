@@ -24,6 +24,10 @@ from agent.turn_recovery import interruptible_backoff_sleep
 logger = logging.getLogger("agent.conversation_loop")
 
 _INLINE_THINK_RE = re.compile(r'<think>|<thinking>|<reasoning>', re.IGNORECASE)
+_TEXT_TOOL_MARKUP_RE = re.compile(
+    r'<(?:[\w.-]+:)?(?:tool_call|tool_calls|function_call|function_calls|toolcall|function|invoke)\b|</?arg_(?:key|value)\b',
+    re.IGNORECASE,
+)
 
 # The persisted user-row display kinds the gateway types as machinery: the self-injected
 # internal_notification turn plus the producer-notice cards (background-process completions,
@@ -100,6 +104,48 @@ def add_empty_response_retry_hint(agent: Any, api_messages: list[dict[str, Any]]
         content = (content or "") + suffix
     api_messages[-1] = {**tail, "content": content}
     return suffix
+
+
+def _stripped_tool_call_markup_hint(agent: Any, assistant_message: Any) -> Optional[str]:
+    """Return a corrective hint when empty text was stripped unoffered tool-call XML markup."""
+    if getattr(assistant_message, "tool_calls", None):
+        return None
+    valid_names = getattr(agent, "valid_tool_names", None) or ()
+    from tools.tool_search_catalog import TOOL_CALL_NAME
+
+    if TOOL_CALL_NAME not in valid_names:
+        return None
+    raw = getattr(assistant_message, "content", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS, _UNTERMINATED_REASONING_BLOCK_PATTERN
+
+    visible = raw
+    for pattern in (*_REASONING_BLOCK_PATTERNS, _UNTERMINATED_REASONING_BLOCK_PATTERN):
+        visible = pattern.sub("", visible)
+    if not _TEXT_TOOL_MARKUP_RE.search(visible):
+        return None
+    from agent.tool_executor import _canonical_tool_name, _tool_search_scoped_names
+
+    scoped = _tool_search_scoped_names(agent)
+    deferred_name = next(
+        (
+            _canonical_tool_name(tok)
+            for tok in re.findall(r"[\w.-]+", visible)
+            if _canonical_tool_name(tok) in scoped and _canonical_tool_name(tok) not in valid_names
+        ),
+        None,
+    )
+    if deferred_name:
+        return (
+            f"Your previous response emitted plain-text tool markup for deferred tool '{deferred_name}'. "
+            f"Do not write XML or <tool_call> tags in text; invoke '{TOOL_CALL_NAME}' via structured "
+            f"tool calling with calls=[{{\"name\": \"{deferred_name}\", \"arguments\": {{...}}}}]."
+        )
+    return (
+        "Your previous response emitted plain-text tool markup instead of a structured tool call. "
+        f"Do not write XML or <tool_call> tags in text; invoke offered tools directly or use '{TOOL_CALL_NAME}' for deferred tools."
+    )
 
 
 def _retry_empty(
@@ -318,10 +364,11 @@ def recover_empty_response(
     # Ollama puts <think> in content, not reasoning_content, so _has_structured misses
     # it; detect here to route to the thinking-only reminder.
     _has_inline_thinking = bool(_INLINE_THINK_RE.search(final_response or ""))
+    markup_hint = _stripped_tool_call_markup_hint(agent, assistant_message)
     if (
         _prior_was_tool
         and not getattr(agent, "_post_tool_empty_retried", False)
-        and not _has_inline_thinking
+        and (markup_hint is not None or not _has_inline_thinking)
     ):
         agent._post_tool_empty_retried = True
         # Clear stale narration so it doesn't resurface on a later empty response.
@@ -329,7 +376,7 @@ def recover_empty_response(
         agent._last_content_tools_all_housekeeping = False
         logger.info("Empty response after tool calls — nudging model " "to continue processing")
         agent._buffer_diagnostic_status("⚠️ Model returned empty after tool calls — " "nudging to continue")
-        agent._empty_response_retry_hint = _EMPTY_TOOL_RESPONSE_NUDGE
+        agent._empty_response_retry_hint = markup_hint or _EMPTY_TOOL_RESPONSE_NUDGE
         final_response = None
         return _verdict("continue")
 
@@ -350,7 +397,7 @@ def recover_empty_response(
         agent._buffer_diagnostic_status(
             f"↻ Thinking-only response — requesting completion ({agent._thinking_prefill_retries}/2)"
         )
-        agent._empty_response_retry_hint = _CODEX_INCOMPLETE_NUDGE
+        agent._empty_response_retry_hint = markup_hint or _CODEX_INCOMPLETE_NUDGE
         final_response = None
         return _verdict("continue")
 
@@ -364,6 +411,8 @@ def recover_empty_response(
         observed_generation=_has_structured,
     )
     if action is not None:
+        if action == "continue" and markup_hint:
+            agent._empty_response_retry_hint = markup_hint
         return _verdict(action, interrupt_result)
 
     if _truly_empty and _deterministic_empty:

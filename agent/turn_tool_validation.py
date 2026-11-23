@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -75,6 +76,140 @@ def _route_deferred_call(agent, tc) -> bool:
     tc.function.arguments = json.dumps({"calls": [{"name": name, "arguments": args}]}, ensure_ascii=False)
     agent._vprint(f"{agent.log_prefix}🔧 Routed deferred tool '{name}' through '{TOOL_CALL_NAME}'",
                   force=True, diagnostic=True)
+    return True
+
+
+_FENCED_CODE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+_TEXT_TOOL_CALL_RE = re.compile(r"<tool_call\b[^>]*>(.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
+_TEXT_CALL_HEAD_RE = re.compile(r"^\s*([\w.:-]+)\s*(.*)$", re.DOTALL)
+_TEXT_ARG_PAIR_RE = re.compile(r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL | re.IGNORECASE)
+
+
+def _blank_out_match(match: re.Match[str]) -> str:
+    return " " * (match.end() - match.start())
+
+
+def _mask_ignored_spans(text: str) -> str:
+    """Mask fenced code blocks and reasoning blocks with equal-length spaces so match offsets stay valid."""
+    from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS, _UNTERMINATED_REASONING_BLOCK_PATTERN
+
+    masked = _FENCED_CODE_RE.sub(_blank_out_match, text)
+    for pattern in (*_REASONING_BLOCK_PATTERNS, _UNTERMINATED_REASONING_BLOCK_PATTERN):
+        masked = pattern.sub(_blank_out_match, masked)
+    return masked
+
+
+def _parse_json_tool_call_body(stripped: str) -> Optional[tuple[str, dict[str, Any]]]:
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    fn = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+    name = fn.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    args = fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args.strip() or "{}")
+        except json.JSONDecodeError:
+            return None
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return name.strip(), args
+
+
+def _parse_xml_tool_call_body(stripped: str) -> Optional[tuple[str, dict[str, Any]]]:
+    head = _TEXT_CALL_HEAD_RE.match(stripped)
+    if not head:
+        return None
+    name, rest = head.group(1), head.group(2)
+    args: dict[str, Any] = {}
+    pos = 0
+    for m in _TEXT_ARG_PAIR_RE.finditer(rest):
+        if rest[pos:m.start()].strip():
+            return None
+        key = m.group(1).strip()
+        if not key:
+            return None
+        args[key] = m.group(2).strip()
+        pos = m.end()
+    if rest[pos:].strip():
+        return None
+    return name, args
+
+
+def _parse_text_tool_call_body(body: str) -> Optional[tuple[str, dict[str, Any]]]:
+    stripped = body.strip()
+    if not stripped:
+        return None
+    if stripped.startswith("{"):
+        return _parse_json_tool_call_body(stripped)
+    return _parse_xml_tool_call_body(stripped)
+
+
+def _strip_spans(text: str, spans: list[tuple[int, int]]) -> str:
+    if not spans:
+        return text
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            out.append(text[cursor:start])
+        cursor = end
+    if cursor < len(text):
+        out.append(text[cursor:])
+    return "".join(out)
+
+
+def extract_deferred_text_tool_calls(agent: Any, assistant_message: Any) -> bool:
+    """Parse complete ``<tool_call>`` text blocks naming scoped deferred tools when a server omits ``tool_calls``."""
+    if getattr(assistant_message, "tool_calls", None):
+        return False
+    content = getattr(assistant_message, "content", None)
+    if not isinstance(content, str) or "<tool_call" not in content.lower():
+        return False
+    from agent.tool_executor import _canonical_tool_name, _tool_search_scoped_names
+    from agent.transports.types import ToolCall
+    from tools.tool_search_catalog import TOOL_CALL_NAME
+
+    valid_names = getattr(agent, "valid_tool_names", None) or ()
+    if TOOL_CALL_NAME not in valid_names:
+        return False
+    scoped = _tool_search_scoped_names(agent)
+    if not scoped:
+        return False
+
+    extracted: list[ToolCall] = []
+    consumed: list[tuple[int, int]] = []
+    for match in _TEXT_TOOL_CALL_RE.finditer(_mask_ignored_spans(content)):
+        parsed = _parse_text_tool_call_body(content[match.start(1):match.end(1)])
+        if not parsed:
+            continue
+        raw_name, args = parsed
+        canonical = _canonical_tool_name(raw_name)
+        if canonical not in scoped or canonical in valid_names:
+            continue
+        try:
+            from tools.arg_coercion import coerce_tool_args
+            args = coerce_tool_args(canonical, dict(args))
+        except (ImportError, KeyError, TypeError, ValueError):
+            logger.debug("Text tool-call arg coercion failed for %s", canonical, exc_info=True)
+        extracted.append(ToolCall(
+            id=f"call_text_{len(extracted) + 1}",
+            name=raw_name,
+            arguments=json.dumps(args, ensure_ascii=False),
+        ))
+        consumed.append(match.span())
+
+    if not extracted:
+        return False
+    assistant_message.tool_calls = extracted
+    assistant_message.content = _strip_spans(content, consumed)
     return True
 
 

@@ -249,4 +249,6 @@ def normalize_model_response(
     if hasattr(agent, "_codex_incomplete_retries"):
         agent._codex_incomplete_retries = 0
         agent._codex_reasoning_only_streak = 0
+    from agent.turn_tool_validation import extract_deferred_text_tool_calls
+    extract_deferred_text_tool_calls(agent, assistant_message)
     return _verdict("fallthrough")
