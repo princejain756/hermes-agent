@@ -1791,25 +1791,28 @@ def dispatch_profile_allowlist_summary() -> str:
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = ? AND assignee IS NOT NULL AND claim_lock IS NULL",
         (status,),
     ).fetchall()
     if not rows:
         return False
     profile_exists = _profile_exists_fn()
-    if profile_exists is None:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
-    return any(profile_exists(row["assignee"]) for row in rows)
+    for row in rows:
+        if profile_exists is not None and not profile_exists(row["assignee"]):
+            continue
+        if check_respawn_guard(conn, row["id"], lane=status) is None:
+            return True
+    return False
 
 
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """True iff a ready+assigned+unclaimed task maps to a real Hermes profile.
+    """True iff an unguarded ready+assigned+unclaimed task maps to a real Hermes profile.
 
     Lets health telemetry tell "stuck" (``0 spawned`` with spawnable work) from
-    "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
-    back to "any assigned" when profiles cannot import and no allowlist is set.
+    "correctly idle" (only control-plane lanes waiting on ``claim_task``, or
+    tasks currently parked by :func:`check_respawn_guard`). Falls back to "any
+    assigned" when profiles cannot import and no allowlist is set.
     """
     return _has_spawnable(conn, "ready")
 

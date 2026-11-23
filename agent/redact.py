@@ -459,6 +459,8 @@ def _looks_like_opaque_credential(value: str) -> bool:
 
 
 _CONFIG_LITERAL_VALUES = frozenset({"true", "false", "yes", "no", "on", "off", "null", "none"})
+_DIAGNOSTIC_COUNTER_KEYS = frozenset({"blocker_auth"})
+_DIAGNOSTIC_COUNTER_VALUE_RE = re.compile(r"^\d{1,6}[.,;:)]*$")
 
 
 def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> bool:
@@ -481,6 +483,10 @@ def _should_redact_assignment(key: str, value: str, *, check_keyword: bool) -> b
     # ``redact_secrets: true`` is configuration state, not a credential: masking a boolean/null
     # literal under a secret-named key corrupts the config view the agent copies back (#142574).
     if value.lower() in _CONFIG_LITERAL_VALUES:
+        return False
+    # Kanban dispatcher suppression counts (``blocker_auth=1``) share the ``_auth=`` assignment
+    # shape; exempt short integer counts on that exact key so diagnostics remain readable.
+    if key.strip().strip("\"'").lower() in _DIAGNOSTIC_COUNTER_KEYS and _DIAGNOSTIC_COUNTER_VALUE_RE.fullmatch(value):
         return False
     if check_keyword and not _key_has_secret_keyword(key):
         return False

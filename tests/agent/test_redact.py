@@ -2024,3 +2024,40 @@ class TestPasswordOnlyConnStrings:
             t0 = time.perf_counter()
             redact_sensitive_text(text, force=True)
             assert time.perf_counter() - t0 < 0.5, unit
+
+
+class TestDiagnosticCounterRedaction:
+    """Kanban suppression counts like ``blocker_auth=1`` must stay visible in logs."""
+
+    def test_blocker_auth_count_preserved_in_stuck_warning(self):
+        msg = (
+            "kanban dispatcher stuck: ready queue non-empty for 6 consecutive "
+            "ticks but 0 workers spawned. Last tick held back: blocker_auth=1. "
+            "Check profile health (venv, PATH, credentials)."
+        )
+        assert redact_sensitive_text(msg, force=True) == msg
+
+    def test_blocker_auth_count_preserved_with_comma_or_bare(self):
+        multi = "Last tick held back: active_pr=2, blocker_auth=3, rate_limited=1."
+        assert redact_sensitive_text(multi, force=True) == multi
+        assert redact_sensitive_text("blocker_auth=12", force=True) == "blocker_auth=12"
+        assert redact_sensitive_text("  blocker_auth=4", force=True) == "  blocker_auth=4"
+
+        formatter = RedactingFormatter("%(levelname)s %(message)s")
+        rec = logging.LogRecord(
+            "gateway.run", logging.WARNING, __file__, 1,
+            "kanban dispatcher stuck: Last tick held back: %s.", ("blocker_auth=2",), None,
+        )
+        assert "blocker_auth=2." in formatter.format(rec)
+
+    @pytest.mark.parametrize("text, leaked", [
+        ("blocker_auth=sk_live_SuperSecretToken1234", "SuperSecret"),
+        ("blocker_auth=1234567890123456", "1234567890123456"),
+        ("redis_auth=1", "1"),
+        ("proxy_auth=mysecret", "mysecret"),
+    ])
+    def test_real_auth_secrets_and_other_auth_keys_still_masked(self, text, leaked):
+        out = redact_sensitive_text(text, force=True)
+        assert out != text
+        assert leaked not in out
+
