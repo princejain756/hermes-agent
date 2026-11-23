@@ -89,14 +89,19 @@ def _blank_out_match(match: re.Match[str]) -> str:
     return " " * (match.end() - match.start())
 
 
-def _mask_ignored_spans(text: str) -> str:
-    """Mask fenced code blocks and reasoning blocks with equal-length spaces so match offsets stay valid."""
+def _mask_reasoning_spans(text: str) -> str:
+    """Mask reasoning blocks with equal-length spaces without blanking code fences."""
     from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS, _UNTERMINATED_REASONING_BLOCK_PATTERN
 
-    masked = _FENCED_CODE_RE.sub(_blank_out_match, text)
+    masked = text
     for pattern in (*_REASONING_BLOCK_PATTERNS, _UNTERMINATED_REASONING_BLOCK_PATTERN):
         masked = pattern.sub(_blank_out_match, masked)
     return masked
+
+
+def _mask_ignored_spans(text: str) -> str:
+    """Mask fenced code blocks and reasoning blocks with equal-length spaces so match offsets stay valid."""
+    return _mask_reasoning_spans(_FENCED_CODE_RE.sub(_blank_out_match, text))
 
 
 def _parse_json_tool_call_body(stripped: str) -> Optional[tuple[str, dict[str, Any]]]:
@@ -207,6 +212,9 @@ def extract_deferred_text_tool_calls(agent: Any, assistant_message: Any) -> bool
         consumed.append(match.span())
 
     if not extracted:
+        return False
+    # Only route text-channel calls when nothing but whitespace remains outside reasoning blocks (#159166).
+    if _strip_spans(_mask_reasoning_spans(content), consumed).strip():
         return False
     assistant_message.tool_calls = extracted
     assistant_message.content = _strip_spans(content, consumed)

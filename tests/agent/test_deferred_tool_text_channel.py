@@ -143,6 +143,14 @@ def test_text_channel_parser_ignores_offered_tools_thinking_and_code_fences(term
         '```xml\n<tool_call>process_manage<arg_key>action</arg_key><arg_value>list</arg_value></tool_call>\n```',
         # Markup inside <think> reasoning block must not execute as a call.
         '<think><tool_call>process_manage<arg_key>action</arg_key><arg_value>list</arg_value></tool_call></think>\nDone.',
+        # Quoted markup in prose must stay inert so discussing logs or docs cannot execute calls.
+        'The server log printed <tool_call>process_manage<arg_key>action</arg_key><arg_value>kill</arg_value><arg_key>session_id</arg_key><arg_value>proc_1</arg_value></tool_call> before failing.',
+        # Quoted markup inside inline code must stay inert.
+        'Example payload: `<tool_call>process_manage<arg_key>action</arg_key><arg_value>kill</arg_value><arg_key>session_id</arg_key><arg_value>proc_1</arg_value></tool_call>`',
+        # Reasoning + prose before a quoted call must also stay inert.
+        '<think>Checking example.</think>\nQuoted line:\n<tool_call>process_manage<arg_key>action</arg_key><arg_value>kill</arg_value></tool_call>',
+        # Fenced markdown before an unfenced call is non-whitespace reply text, so keep it inert.
+        '```xml\n<tool_call>process_manage<arg_key>action</arg_key><arg_value>list</arg_value></tool_call>\n```\n<tool_call>process_manage<arg_key>action</arg_key><arg_value>kill</arg_value></tool_call>',
     ]
     for sample in samples:
         verdict = normalize_model_response(
