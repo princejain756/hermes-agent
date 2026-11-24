@@ -1903,18 +1903,18 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
     # agent.api_key may be a callable (Azure Foundry Entra ID); get_model_context_length expects a
     # string for live probes, so coerce defensively.
     ctx_api_key = agent.api_key if isinstance(agent.api_key, str) else ""
+    if effective_context_length is None:
+        from agent.model_metadata_cache import invalidate_switch_routes
+        invalidate_switch_routes(((agent.model, agent.base_url, agent.provider),))
     try:
         new_context_length = get_model_context_length(
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
             config_context_length=effective_context_length, custom_providers=custom_providers,
         )
         agent.context_compressor.update_model(
-            model=agent.model,
-            context_length=new_context_length,
-            base_url=agent.base_url,
+            model=agent.model, context_length=new_context_length, base_url=agent.base_url,
             api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
-            provider=agent.provider,
-            api_mode=agent.api_mode,
+            provider=agent.provider, api_mode=agent.api_mode,
         )
     except Exception:
         _restore_switch_snapshot(agent, snapshot)

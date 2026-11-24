@@ -1186,26 +1186,9 @@ def get_cached_context_length(model: str, base_url: str, *, bedrock_confirmed: b
 
 
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:
-    """Drop a stale entry and its probe cooldown using the persisted cache URL.
-
-    Bedrock callers without a runtime endpoint must pass ``bedrock://``, as
-    the resolver does; a blank URL addresses the distinct generic cache key.
-    In-process caches are dropped unconditionally; only the file update takes the cache lock.
-    """
-    from agent.model_metadata_cache import drop_context_cache_rows
-    key = _context_cache_key(model, base_url)
-    # Also drop the in-memory TTL probe entries, or the next resolution inside the TTL window reuses the stale value.
-    bare, stripped = _strip_provider_prefix(model), (base_url or "").rstrip("/")
-    _LOCAL_CTX_PROBE_CACHE.pop((bare, stripped), None)
-    _LOCAL_CTX_PROBE_CACHE.pop(("ollama_show", bare, stripped), None)
-    # Same for a memoised Bedrock probe failure (keyed by region, which the caller does not know):
-    # the entry being dropped is the reason to ask the probe again, not to wait out its TTL.
-    from hermes_constants import hermes_home_key
-    for memo_key in list(_BEDROCK_PROBE_FAILURE_CACHE):  # snapshot: another thread may be memoising
-        if memo_key[:2] == (hermes_home_key(), stripped) and memo_key[2] in (model, bare):
-            _BEDROCK_PROBE_FAILURE_CACHE.pop(memo_key, None)
-    # Every key shape get_cached_context_length consults.
-    drop_context_cache_rows({key, f"{model}@{base_url}", f"{key}/"}, key)
+    """Drop stale in-memory and disk context-length caches for ``model`` at ``base_url``."""
+    from agent.model_metadata_cache import invalidate_context_length_caches
+    invalidate_context_length_caches(model, base_url)
 
 
 def get_next_probe_tier(current_length: int) -> Optional[int]:

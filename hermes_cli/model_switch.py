@@ -1757,8 +1757,10 @@ def model_derived_api_mode(provider: str, model: str, api_key: str = "") -> Opti
 
 def _build_switch_result(st: _Switch) -> ModelSwitchResult:
     """COMMON PATH part 3: final api_mode / base_url shaping, metadata, warnings."""
+    from agent.model_metadata_cache import invalidate_switch_routes
     from hermes_cli.runtime_provider_custom import persisted_provider_id
     st.target_provider = persisted_provider_id(st.target_provider, st.user_providers)
+    invalidate_switch_routes(((st.new_model, st.base_url, st.target_provider), (st.current_model, st.current_base_url, st.current_provider)))
     derived = model_derived_api_mode(st.target_provider, st.new_model, st.api_key)
     if derived is not None:
         st.api_mode = derived
