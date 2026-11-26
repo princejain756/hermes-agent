@@ -49,12 +49,23 @@ def _note_turn_pause(session: dict, resume: bool) -> None:
             turn["_pause"] = resume
 
 
+def _same_inflight_turn(captured, current) -> bool:
+    """True when ``current`` represents the same turn captured before the lock dropped, including shallow copies."""
+    if not isinstance(captured, dict) or not isinstance(current, dict):
+        return False
+    captured_token = captured.get("_turn_token")
+    current_token = current.get("_turn_token")
+    if captured_token is not None or current_token is not None:
+        return captured_token is not None and captured_token == current_token
+    return current is captured
+
+
 def _recover_unreachable_compute_host_turn(sid: str, session: dict, inflight_at_interrupt) -> None:
     """Stop on a compute host that is gone (broken pipe, respawn exhausted, #82603).
 
     The failed dial raised before ``_interrupt_session_turn`` purged the queue, and no ``turn.end`` will ever
-    clear ``running``, so every later submit would queue forever. Clear the turn only when the supervisor owes
-    no completion for it and the inflight dict is still the one this Stop saw (a successor turn keeps its own).
+    clear ``running``, so every later submit would queue forever. Skip recovery when a different turn already
+    owns ``inflight_turn``, and clear ``running`` only when the supervisor owes no completion for this turn.
     The probe runs outside ``history_lock``: compute-host calls never run under it.
     """
     try:
@@ -63,12 +74,14 @@ def _recover_unreachable_compute_host_turn(sid: str, session: dict, inflight_at_
         logger.warning("session.interrupt: compute-host pending-turn probe failed for %s: %s", sid, exc)
         pending = True
     with session["history_lock"]:
+        inflight_now = session.get("inflight_turn")
+        if inflight_now is not None and not _same_inflight_turn(inflight_at_interrupt, inflight_now):
+            return
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
-        inflight_now = session.get("inflight_turn")
-        if not pending and session.get("running") and inflight_now is not None and inflight_now is inflight_at_interrupt:
+        if not pending and session.get("running") and _same_inflight_turn(inflight_at_interrupt, inflight_now):
             session["running"] = False
             _clear_inflight_turn(session)
     _clear_pending(sid)

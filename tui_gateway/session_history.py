@@ -4,6 +4,7 @@ turn tracking and turn-failure detail. Bodies are rebound onto server.py's globa
 from __future__ import annotations
 
 import re
+import uuid
 
 from .method_ctx import bind_module
 from agent.prompt_builder import STEER_DISPLAY_KIND
@@ -401,7 +402,7 @@ def _start_inflight_turn(
     now = time.time()
     turn = {
         "assistant": "", "started_at": now, "streaming": True, "updated_at": now,
-        "user": _inflight_text(text),
+        "user": _inflight_text(text), "_turn_token": uuid.uuid4().hex,
     }
     if display_kind:
         turn["display_kind"] = display_kind
@@ -416,7 +417,7 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
         return
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "streaming": True, "user": ""}
+        turn = {"assistant": "", "streaming": True, "user": "", "_turn_token": uuid.uuid4().hex}
     turn.update(assistant=f"{turn.get('assistant') or ''}{text}", streaming=True, updated_at=time.time())
     session["inflight_turn"] = turn
 
@@ -452,7 +453,7 @@ def _fail_inflight_turn(session: dict, error: Any, error_surface: Optional[dict]
     now = time.time()
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "user": "", "started_at": now}
+        turn = {"assistant": "", "user": "", "started_at": now, "_turn_token": uuid.uuid4().hex}
     turn.update(
         assistant=str(turn.get("assistant") or ""), user=str(turn.get("user") or ""),
         error=message or "turn failed", status="error", recoverable=True,

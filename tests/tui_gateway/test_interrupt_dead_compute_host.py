@@ -96,12 +96,30 @@ def test_a_successor_turn_that_replaced_inflight_is_not_clobbered(monkeypatch):
     new_inflight = {"user": "new", "assistant": "", "streaming": True}
     host = _DeadComputeHost()
     session = _isolated_session("iso-race", monkeypatch, host, inflight_turn=old_inflight)
+    cleared_pending = []
+    cancelled_approvals = []
+    resolved_approvals = []
+    monkeypatch.setattr(server, "_clear_pending", lambda s: cleared_pending.append(s))
+    monkeypatch.setattr(
+        server,
+        "_announce_cancelled_gateway_approvals",
+        lambda s, reason, session_id=None: cancelled_approvals.append((reason, session_id)),
+    )
+    import tools.approval as approval_mod
+    monkeypatch.setattr(
+        approval_mod,
+        "resolve_gateway_approval",
+        lambda key, decision, resolve_all=False: resolved_approvals.append((key, decision, resolve_all)),
+    )
 
     def interrupt_and_swap(sid, *, request_id=None):
         # prompt.submit replaces inflight after history_lock is released, before submit_turn registers it.
         with session["history_lock"]:
             session["inflight_turn"] = new_inflight
             session["_turn_cancel_requested"] = False
+            session["queued_prompt"] = {"text": "keep me", "transport": None}
+            session["queued_prompts"] = [{"text": "keep me", "transport": None}]
+            session["_queued_prompt_generation"] = 3
         raise RuntimeError("compute host is not running")
 
     host.interrupt = interrupt_and_swap
@@ -111,7 +129,70 @@ def test_a_successor_turn_that_replaced_inflight_is_not_clobbered(monkeypatch):
     assert resp.get("result") == {"status": "interrupted", "turn_isolation": True}, resp
     assert session["running"] is True
     assert session.get("inflight_turn") is new_inflight
+    assert session["_turn_cancel_requested"] is False
+    assert session["queued_prompt"] == {"text": "keep me", "transport": None}
+    assert session["queued_prompts"] == [{"text": "keep me", "transport": None}]
+    assert session["_queued_prompt_generation"] == 3
+    assert cleared_pending == []
+    assert cancelled_approvals == []
+    assert resolved_approvals == []
+
+
+def test_steered_turn_still_clears_on_dead_host_recovery(monkeypatch):
+    host = _DeadComputeHost()
+    session = _isolated_session("iso-steered", monkeypatch, host)
+    server._start_inflight_turn(session, "initial")
+    cleared_pending = []
+    monkeypatch.setattr(server, "_clear_pending", lambda s: cleared_pending.append(s))
+
+    def interrupt_and_steer(sid, *, request_id=None):
+        with session["history_lock"]:
+            server._record_inflight_correction(session, "redirected")
+        raise RuntimeError("compute host is not running")
+
+    host.interrupt = interrupt_and_steer
+
+    resp = _interrupt("iso-steered")
+
+    assert resp.get("result") == {"status": "interrupted", "turn_isolation": True}, resp
+    assert session["running"] is False
+    assert session.get("inflight_turn") is None
     assert session["_turn_cancel_requested"] is True
+    assert cleared_pending == ["iso-steered"]
+
+
+def test_idle_capture_followed_by_new_turn_does_not_clobber_successor(monkeypatch):
+    host = _DeadComputeHost()
+    session = _isolated_session("iso-idle-race", monkeypatch, host, running=False, inflight_turn=None)
+    cleared_pending = []
+    monkeypatch.setattr(server, "_clear_pending", lambda s: cleared_pending.append(s))
+
+    def interrupt_and_start(sid, *, request_id=None):
+        with session["history_lock"]:
+            server._start_inflight_turn(session, "fresh")
+            session["running"] = True
+            session["_turn_cancel_requested"] = False
+            session["queued_prompt"] = {"text": "queued", "transport": None}
+        raise RuntimeError("compute host is not running")
+
+    host.interrupt = interrupt_and_start
+
+    resp = _interrupt("iso-idle-race")
+
+    assert resp.get("result") == {"status": "interrupted", "turn_isolation": True}, resp
+    assert session["running"] is True
+    assert session["_turn_cancel_requested"] is False
+    assert session["queued_prompt"] == {"text": "queued", "transport": None}
+    assert cleared_pending == []
+
+
+def test_inflight_snapshot_hides_turn_token():
+    session = {"inflight_turn": None}
+    server._start_inflight_turn(session, "hello")
+    assert "_turn_token" in session["inflight_turn"]
+    snap = server._inflight_snapshot(session)
+    assert snap is not None
+    assert "_turn_token" not in snap
 
 
 def test_supervisor_reports_pending_turns_per_session():
